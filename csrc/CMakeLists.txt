@@ -17,11 +17,11 @@ endif()
 if(NOT SKIP_BUILD_FA)
 
   set(CUTLASS_3_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cutlass)
-  
-  
+
+
   find_package(PythonInterp REQUIRED)
-  
-  
+
+
   execute_process(
       COMMAND "${PYTHON_EXECUTABLE}" flash_attn/src/generate_kernels.py -o flash_attn/src
       WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -58,46 +58,46 @@ if(NOT SKIP_BUILD_FA)
       flash_attn/src/calc_reduced_attn_scores_dispatch/hdim256_bf16_sm80.cu
   )
   
-  # merge FA2 cu sources
-  set(FA2_SOURCES_CU ${FA2_REDUCE_ATTNSCORE_SOURCES_CU} ${FA2_SOURCES_CU_SOURCES})
+  # # merge FA2 cu sources
+  # set(FA2_SOURCES_CU ${FA2_REDUCE_ATTNSCORE_SOURCES_CU} ${FA2_SOURCES_CU_SOURCES})
+  # 
+  # add_library(flashattn SHARED
+  #     capi/flash_attn.cu
+  #     ${FA2_SOURCES_CU}
+  #   )
+  # 
+  # set(FA1_SOURCES_CU
+  #     flash_attn_with_bias_and_mask/flash_attn_with_bias_mask.cu
+  #     flash_attn_with_bias_and_mask/src/cuda_utils.cu
+  #     flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim32.cu
+  #     flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim64.cu
+  #     flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim128.cu
+  #     flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim32.cu
+  #     flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim64.cu
+  #     flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim128.cu
+  #     flash_attn_with_bias_and_mask/src/utils.cu)
+  # 
+  # add_library(flashattn_with_bias_mask STATIC
+  #     ${FA1_SOURCES_CU}
+  #   )
   
-  add_library(flashattn SHARED
-      capi/flash_attn.cu
-      ${FA2_SOURCES_CU}
-    )
-  
-  set(FA1_SOURCES_CU
-      flash_attn_with_bias_and_mask/flash_attn_with_bias_mask.cu
-      flash_attn_with_bias_and_mask/src/cuda_utils.cu
-      flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim32.cu
-      flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim64.cu
-      flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim128.cu
-      flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim32.cu
-      flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim64.cu
-      flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim128.cu
-      flash_attn_with_bias_and_mask/src/utils.cu)
-  
-  add_library(flashattn_with_bias_mask STATIC
-      ${FA1_SOURCES_CU}
-    )
-  
-  target_include_directories(flashattn PRIVATE
-      flash_attn
-      ${CUTLASS_3_DIR}/include)
-  
-  target_include_directories(flashattn_with_bias_mask PRIVATE
-      flash_attn_with_bias_and_mask/src
-      flash_attn_with_bias_and_mask/cutlass/include
-      ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-  
-  target_include_directories(flashattn_with_bias_mask INTERFACE
-      flash_attn_with_bias_and_mask)
-  
-  target_link_libraries(flashattn flashattn_with_bias_mask)
-    
-  add_dependencies(flashattn flashattn_with_bias_mask)
-  
-  
+  # target_include_directories(flashattn PRIVATE
+  #     flash_attn
+  #     ${CUTLASS_3_DIR}/include)
+  # 
+  # target_include_directories(flashattn_with_bias_mask PRIVATE
+  #     flash_attn_with_bias_and_mask/src
+  #     flash_attn_with_bias_and_mask/cutlass/include
+  #     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  # 
+  # target_include_directories(flashattn_with_bias_mask INTERFACE
+  #     flash_attn_with_bias_and_mask)
+  # 
+  # target_link_libraries(flashattn flashattn_with_bias_mask)
+  #   
+  # add_dependencies(flashattn flashattn_with_bias_mask)
+# 
+# 
   if(NOT DEFINED NVCC_ARCH_BIN OR NVCC_ARCH_BIN STREQUAL "")
       message(FATAL_ERROR "NVCC_ARCH_BIN is not defined or is empty.")
   endif()
@@ -111,40 +111,38 @@ if(NOT SKIP_BUILD_FA)
      endif()
   endforeach()
   
-  target_compile_options(flashattn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
-    -w
-    -Xcompiler="-fPIC"
-    -Xcompiler="-O3"
-    -std=c++17
-    -U__CUDA_NO_HALF_OPERATORS__
-    -U__CUDA_NO_HALF_CONVERSIONS__
-    -U__CUDA_NO_HALF2_OPERATORS__
-    -U__CUDA_NO_BFLOAT16_CONVERSIONS__
-    --expt-relaxed-constexpr
-    --expt-extended-lambda
-    --use_fast_math
-    "${FA_GENCODE_OPTION}"
-    >)
+  # target_compile_options(flashattn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
+  #   -w
+  #   -Xcompiler="-fPIC"
+  #   -Xcompiler="-O3"
+  #   -std=c++17
+  #   -U__CUDA_NO_HALF_OPERATORS__
+  #   -U__CUDA_NO_HALF_CONVERSIONS__
+  #   -U__CUDA_NO_HALF2_OPERATORS__
+  #   -U__CUDA_NO_BFLOAT16_CONVERSIONS__
+  #   --expt-relaxed-constexpr
+  #   --expt-extended-lambda
+  #   --use_fast_math
+  #   "${FA_GENCODE_OPTION}"
+  #   >)
+  # 
+  # target_compile_options(flashattn_with_bias_mask PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
+  #   -w
+  #   -Xcompiler="-fPIC"
+  #   -Xcompiler="-O3"
+  #   -std=c++17
+  #   -U__CUDA_NO_HALF_OPERATORS__
+  #   -U__CUDA_NO_HALF_CONVERSIONS__
+  #   -U__CUDA_NO_HALF2_OPERATORS__
+  #   -U__CUDA_NO_BFLOAT16_CONVERSIONS__
+  #   --expt-relaxed-constexpr
+  #   --expt-extended-lambda
+  #   --use_fast_math
+  #   "${FA_GENCODE_OPTION}"
+  #   >)
   
-  target_compile_options(flashattn_with_bias_mask PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
-    -w
-    -Xcompiler="-fPIC"
-    -Xcompiler="-O3"
-    -std=c++17
-    -U__CUDA_NO_HALF_OPERATORS__
-    -U__CUDA_NO_HALF_CONVERSIONS__
-    -U__CUDA_NO_HALF2_OPERATORS__
-    -U__CUDA_NO_BFLOAT16_CONVERSIONS__
-    --expt-relaxed-constexpr
-    --expt-extended-lambda
-    --use_fast_math
-    "${FA_GENCODE_OPTION}"
-    >)
-  
-  INSTALL(TARGETS flashattn
-      LIBRARY DESTINATION "lib")
-  
-  INSTALL(FILES capi/flash_attn.h DESTINATION "include")
+  # INSTALL(TARGETS flashattn LIBRARY DESTINATION "lib")
+  # INSTALL(FILES capi/flash_attn.h DESTINATION "include")
   
   if(WITH_FLASHATTN_V3)
     execute_process(
@@ -157,19 +155,19 @@ if(NOT SKIP_BUILD_FA)
 
     # Assume options or variables are defined elsewhere in the CMake project
     # You can define them for testing purposes like this:
-    option(DISABLE_FP16 "Disable FP16" OFF)
-    option(DISABLE_FP8 "Disable FP8" OFF)
-    option(DISABLE_HDIM64 "Disable HDIM64" OFF)
-    option(DISABLE_HDIM96 "Disable HDIM96" OFF)
+    option(DISABLE_FP16 "Disable FP16" ON)
+    option(DISABLE_FP8 "Disable FP8" ON)
+    option(DISABLE_HDIM64 "Disable HDIM64" ON)
+    option(DISABLE_HDIM96 "Disable HDIM96" ON)
     option(DISABLE_HDIM128 "Disable HDIM128" OFF)
-    option(DISABLE_HDIM192 "Disable HDIM192" OFF)
+    option(DISABLE_HDIM192 "Disable HDIM192" ON)
     option(DISABLE_HDIM256 "Disable HDIM256" OFF)
-    option(DISABLE_SPLIT "Disable Split" OFF)
-    option(DISABLE_PAGEDKV "Disable PagedKV" OFF)
-    option(DISABLE_SOFTCAP "Disable Softcap" OFF)
-    option(DISABLE_PACKGQA "Disable PackGQA" OFF)
+    option(DISABLE_SPLIT "Disable Split" ON)
+    option(DISABLE_PAGEDKV "Disable PagedKV" ON)
+    option(DISABLE_SOFTCAP "Disable Softcap" ON)
+    option(DISABLE_PACKGQA "Disable PackGQA" ON)
     option(DISABLE_BACKWARD "Disable Backward" OFF)
-    option(DISABLE_SM8X "Disable SM8x" OFF)
+    option(DISABLE_SM8X "Disable SM8x" ON)
 
     if(DISABLE_FP16)
       add_compile_definitions(FLASHATTENTION_DISABLE_FP16)
@@ -366,6 +364,7 @@ if(NOT SKIP_BUILD_FA)
     list(APPEND FA3_SOURCES_CU_SOURCES "flash_attn_v3/flash_prepare_scheduler.cu")
 
     message(STATUS "Auto generated CUDA source files: ${FA3_SOURCES_CU_SOURCES}")
+
     add_library(flashattnv3 SHARED
         ${FA3_SOURCES_CU_SOURCES}
       )
@@ -381,8 +380,8 @@ if(NOT SKIP_BUILD_FA)
       -std=c++17
       --ftemplate-backtrace-limit=0
       --use_fast_math
-      --resource-usage
-      -lineinfo
+      # --resource-usage
+      # -lineinfo
       -DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED # Necessary for the WGMMA shapes that we use
       -DCUTLASS_ENABLE_GDC_FOR_SM90 # For PDL
       -DCUTLASS_DEBUG_TRACE_LEVEL=0 # Can toggle for debugging
@@ -391,9 +390,7 @@ if(NOT SKIP_BUILD_FA)
       --expt-relaxed-constexpr
       >)
   
-    INSTALL(TARGETS flashattnv3
-        LIBRARY DESTINATION "lib")
-  
+    INSTALL(TARGETS flashattnv3 LIBRARY DESTINATION "lib")
     INSTALL(FILES flash_attn_v3/flash_api.h DESTINATION "include" RENAME flashv3_api.h)
   endif()
 
@@ -408,11 +405,11 @@ if(NOT SKIP_BUILD_FA)
 
     option(DISABLE_FLASHMASK_V2_FP16 "Disable FP16 for flashmask_v2" ON)
     option(DISABLE_FLASHMASK_V2_FP8 "Disable FP8 for flashmask_v2" ON)
-    option(DISABLE_FLASHMASK_V2_HDIM64 "Disable HDIM64 for flashmask_v2" OFF)
+    option(DISABLE_FLASHMASK_V2_HDIM64 "Disable HDIM64 for flashmask_v2" ON)
     option(DISABLE_FLASHMASK_V2_HDIM96 "Disable HDIM96 for flashmask_v2" ON)
     option(DISABLE_FLASHMASK_V2_HDIM128 "Disable HDIM128 for flashmask_v2" OFF)
     option(DISABLE_FLASHMASK_V2_HDIM192 "Disable HDIM192 for flashmask_v2" ON)
-    option(DISABLE_FLASHMASK_V2_HDIM256 "Disable HDIM256 for flashmask_v2" ON)
+    option(DISABLE_FLASHMASK_V2_HDIM256 "Disable HDIM256 for flashmask_v2" OFF)
     option(DISABLE_FLASHMASK_V2_SPLIT "Disable Split for flashmask_v2" ON)
     option(DISABLE_FLASHMASK_V2_PAGEDKV "Disable PagedKV for flashmask_v2" ON)
     option(DISABLE_FLASHMASK_V2_SOFTCAP "Disable Softcap for flashmask_v2" ON)
@@ -556,7 +553,7 @@ if(NOT SKIP_BUILD_FA)
             endforeach()
         endforeach()
     endforeach()
-    
+  
     set(flashmaskv2_sources_fwd_sm90)
     foreach(hdim ${FLASHMASKV2_HEAD_DIMENSIONS_FWD})
         foreach(dtype ${FLASHMASKV2_DTYPE_FWD_SM90})
@@ -605,11 +602,6 @@ if(NOT SKIP_BUILD_FA)
         set(flashmaskv2_sources_bwd_sm90 "")
     endif()
 
-    #TODO:change
-
-    set(flashmaskv2_sources_fwd_sm80 "")
-    set(flashmaskv2_sources_fwd_sm90 "")
-    
     set(FLASHMASKV2_SOURCES_CU_SOURCES "flashmask_v2/flash_api.cu")
     if(NOT DISABLE_FLASHMASK_V2_SM8X)
         list(APPEND FLASHMASKV2_SOURCES_CU_SOURCES ${flashmaskv2_sources_fwd_sm80})
@@ -626,40 +618,35 @@ if(NOT SKIP_BUILD_FA)
     
     list(APPEND FLASHMASKV2_SOURCES_CU_SOURCES "flashmask_v2/flash_prepare_scheduler.cu")
 
-    list(APPEND FLASHMASKV2_SOURCES_CU_SOURCES "flashmask_v2/instantiations/flash_fwd_hdim128_bf16_sm90.cu" 
-                                                "flashmask_v2/instantiations/flash_fwd_hdim64_bf16_sm90.cu")
-
     message(STATUS "Auto generated CUDA source files for flashmask_v2: ${FLASHMASKV2_SOURCES_CU_SOURCES}")
 
     # 3. 添加动态库
     add_library(flashmaskv2 SHARED
-        ${FLASHMASKV2_SOURCES_CU_SOURCES}
+       ${FLASHMASKV2_SOURCES_CU_SOURCES}
     )
 
     target_include_directories(flashmaskv2 PRIVATE
-        flashmask_v2
-        flashmask_v2/cutlass/include
+       flashmask_v2
+       flashmask_v2/cutlass/include
     )
 
     target_compile_options(flashmaskv2 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
-      -Xcompiler="-fPIC"
-      -Xcompiler="-O3"
-      -std=c++17
-      --ftemplate-backtrace-limit=0
-      --use_fast_math
-      --resource-usage
-      -lineinfo
-      -DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED # Necessary for the WGMMA shapes that we use
-      -DCUTLASS_ENABLE_GDC_FOR_SM90 # For PDL
-      -DCUTLASS_DEBUG_TRACE_LEVEL=0 # Can toggle for debugging
-      -DNDEBUG # Important, otherwise performance is severely impacted
-      -gencode arch=compute_90a,code=sm_90a
-      --expt-relaxed-constexpr
-      >)
+     -Xcompiler="-fPIC"
+     -Xcompiler="-O3"
+     -std=c++17
+     --ftemplate-backtrace-limit=0
+     --use_fast_math
+    #  --resource-usage
+    #  -lineinfo
+     -DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED # Necessary for the WGMMA shapes that we use
+     -DCUTLASS_ENABLE_GDC_FOR_SM90 # For PDL
+     -DCUTLASS_DEBUG_TRACE_LEVEL=0 # Can toggle for debugging
+     -DNDEBUG # Important, otherwise performance is severely impacted
+     -gencode arch=compute_90a,code=sm_90a
+     --expt-relaxed-constexpr
+     >)
 
-    INSTALL(TARGETS flashmaskv2
-        LIBRARY DESTINATION "lib")
-
+    INSTALL(TARGETS flashmaskv2 LIBRARY DESTINATION "lib")
     INSTALL(FILES flashmask_v2/flash_api.h DESTINATION "include" RENAME flashmaskv2_api.h)
 
   endif()
