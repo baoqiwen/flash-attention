@@ -215,8 +215,11 @@ public:
         __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
         __shared__ __align__(128) int32_t flashmask_maxmin_smem[num_sch_stage * 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
         __shared__ int32_t n_block_smem[num_sch_stage * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+         __shared__ __align__(128) int32_t blockmask_smem_[CollectiveMainloop::Blockmask_n_block_buffer_valid_length * CollectiveMainloop::kNBlockStages];
         // When n_block_smem is full, we need to store the flag in the following extra flag storage, instead of allocating 4 more elements
         __shared__ int32_t extra_flags[4];   // if num_sch_stage is 1, we actually only need two (kNBlockStages = 2)
+
+        bool Is_blockmask = params.mainloop.block_mask_ptr != nullptr;
 
         if constexpr (Use_Sch_Pipeline) {
             if (threadIdx.x < 2) {
@@ -317,10 +320,18 @@ public:
                             n_block_min, n_block_max, seqlen_info.seqlen_q,                                                                                     \
                             flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage),        \
                             n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage),                     \
-                            extra_flags + n_block_pipe_write.index() + cppl_stage)
+                            extra_flags + n_block_pipe_write.index() + cppl_stage,                                                                              \
+                            Is_blockmask, \
+                            blockmask_smem_ + CollectiveMainloop::Blockmask_n_block_buffer_valid_length * (n_block_pipe_write.index() + cppl_stage))              
+                            
+
               for(int reverse_chunk_idx = 0; reverse_chunk_idx < num_chunk; reverse_chunk_idx++) {
                 if (valid_chunk)
                     pipeline_n_block.producer_acquire(n_block_pipe_write);
+                if (Is_blockmask) {
+                    mainloop.load_blockmask(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, num_chunk,
+                                      blockmask_smem_ + CollectiveMainloop::Blockmask_n_block_buffer_valid_length * (n_block_pipe_write.index() + cppl_stage));
+                }
                 mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, num_chunk, flashmask_maxmin_smem +
                                       8 * CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage));
                 if (params.mainloop.ut_start_ptr) {
