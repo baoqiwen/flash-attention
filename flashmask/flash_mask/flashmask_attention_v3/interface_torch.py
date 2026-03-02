@@ -24,11 +24,12 @@ import os
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
-import flashmask._C # Registers operators with PyTorch
+import flashmask._C  # Registers operators with PyTorch
 
 # isort: on
 
 flashmask_cuda = torch.ops.flashmask
+
 
 class FlashMaskFunc(torch.autograd.Function):
     @staticmethod
@@ -48,23 +49,24 @@ class FlashMaskFunc(torch.autograd.Function):
             softcap=softcap
             # 其他参数 C++ 端有默认值 None/0，这里不用传
         )
-        
+
         # 2. 保存用于反向传播的 Tensor 和参数
-        ctx.save_for_backward(q, k, v, out, lse, startend_row_indices, block_mask)
+        ctx.save_for_backward(
+            q, k, v, out, lse, startend_row_indices, block_mask)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size_left = window_size_left
         ctx.window_size_right = window_size_right
         ctx.softcap = softcap
         ctx.deterministic = deterministic
-        
+
         return out, lse
 
     @staticmethod
     def backward(ctx, dout, dlse):
         # 1. 取出保存的 Tensor
         q, k, v, out, lse, startend_row_indices, block_mask = ctx.saved_tensors
-        
+
         # 2. 调用 C++ 反向算子
         # 注意：这里的参数名必须和 flash_api.cpp 中 m.def("bwd(...") 定义的一致
         dq, dk, dv = flashmask_cuda.bwd(
@@ -74,14 +76,14 @@ class FlashMaskFunc(torch.autograd.Function):
             v=v,
             out=out,
             softmax_lse=lse,
-            dq=None, # 可选，C++ 会自动分配
+            dq=None,  # 可选，C++ 会自动分配
             dk=None,
             dv=None,
             cu_seqlens_q=None,
             cu_seqlens_k=None,
             seqused_q=None,
             seqused_k=None,
-            startend_row_indices=startend_row_indices, # 传入 mask
+            startend_row_indices=startend_row_indices,  # 传入 mask
             block_mask=block_mask,                     # 传入 block mask
             max_seqlen_q=None,
             max_seqlen_k=None,
@@ -93,11 +95,12 @@ class FlashMaskFunc(torch.autograd.Function):
             deterministic=ctx.deterministic,
             sm_margin=0
         )
-        
+
         # 3. 返回梯度
-        # 顺序必须对应 forward 的输入: 
+        # 顺序必须对应 forward 的输入:
         # (q, k, v, startend_row_indices, block_mask, softmax_scale, causal, window_size_left, window_size_right, softcap, deterministic)
         return dq, dk, dv, None, None, None, None, None, None, None, None
+
 
 def flashmask_attention(
     query: Tensor,
@@ -763,18 +766,19 @@ def flashmask_attention(
         )
         if causal:
             startend_row_indices = torch.arange(
-                window_size[0] + 1, sq + window_size[0] + 1, dtype=torch.int32, device=query.device
+                window_size[0] + 1, sq + window_size[0] + 1, dtype=torch.int32, device=device
             ).reshape((1, 1, sq, 1))
             startend_row_indices = torch.clip(
                 startend_row_indices, max=sq
             ).repeat_interleave(bsz, 0)
         else:
-            startend_row_indices = torch.empty((1, 1, sq, 2), dtype=torch.int32, device=query.device)
+            startend_row_indices = torch.empty(
+                (1, 1, sq, 2), dtype=torch.int32, device=device)
             startend_row_indices[0, 0, :, 0] = torch.arange(
-                window_size[0] + 1, sq + window_size[0] + 1, dtype=torch.int32, device=query.device
+                window_size[0] + 1, sq + window_size[0] + 1, dtype=torch.int32, device=device
             )
             startend_row_indices[0, 0, :, 1] = torch.arange(
-                -window_size[1], sq - window_size[1], dtype=torch.int32, device=query.device
+                -window_size[1], sq - window_size[1], dtype=torch.int32, device=device
             )
             startend_row_indices = torch.clip(
                 startend_row_indices, min=0, max=sq
@@ -861,8 +865,10 @@ def flashmask_attention(
                     f"Invalid shape of startend_row_indices, when causal is False, the last dimension should be either 2 or 4 but got {startend_row_indices.shape[-1]}"
                 )
 
-        flag_flash_attn_version = int(os.getenv("FLAGS_flash_attn_version", "3"))
-        flag_cudnn_deterministic = os.getenv("FLAGS_cudnn_deterministic", "0") == "1"
+        flag_flash_attn_version = int(
+            os.getenv("FLAGS_flash_attn_version", "3"))
+        flag_cudnn_deterministic = os.getenv(
+            "FLAGS_cudnn_deterministic", "0") == "1"
 
         if (
             "xpu" not in current_device_type
@@ -884,7 +890,8 @@ def flashmask_attention(
             fa_version = flag_flash_attn_version
 
         if fa_version == 2:
-            raise NotImplementedError("FlashMask is not supported. Please use FlashMask V3.")
+            raise NotImplementedError(
+                "FlashMask is not supported. Please use FlashMask V3.")
 
         elif fa_version == 3:
             assert dropout == 0.0, (
