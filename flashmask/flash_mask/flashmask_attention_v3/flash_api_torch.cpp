@@ -1343,10 +1343,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mha_bwd(
                 "blockmask only supports seqlen <= 128k in bwd now");
   }
 
-  const bool has_lt_start = lt_start_row_indices.defined();
   const bool has_lt_end = lt_end_row_indices.defined();
   const bool has_ut_start = ut_start_row_indices.defined();
-  const bool has_ut_end = ut_end_row_indices.defined();
 
   const auto [kBlockM_sm90, kBlockN_sm90] = [&]() -> std::pair<int, int> {
     if (head_size_rounded <= 64) {
