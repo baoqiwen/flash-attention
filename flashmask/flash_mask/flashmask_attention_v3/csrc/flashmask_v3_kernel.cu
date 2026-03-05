@@ -82,8 +82,7 @@ void FlashMaskV3BaseKernel(
 
   // TODO(umiswing): support ampere
   int device_id = place.GetDeviceId();
-  cudaDeviceProp dprops;
-  cudaGetDeviceProperties(&dprops, device_id);
+  const cudaDeviceProp &dprops = GetCachedDeviceProperties(device_id);
 
   const bool is_sm90 = dprops.major == 9 && dprops.minor == 0;
   PADDLE_ENFORCE_EQ(is_sm90, true,
@@ -528,15 +527,14 @@ void FlashMaskV3BaseKernel(
                         common::errors::InvalidArgument(
                             "scheduler_metadata must have dtype int32"));
       tile_count_semaphore = scheduler_metadata;
+    } else if (scheduler_needs_semaphore && !use_dynamic_split) {
+      // Need zero-initialized semaphore, allocate directly with paddle::full
+      tile_count_semaphore =
+          paddle::full({metadata_size}, int32_t{0},
+                       paddle::DataType::INT32, place);
     } else {
       tile_count_semaphore =
           paddle::empty({metadata_size}, paddle::DataType::INT32, place);
-    }
-    if (scheduler_needs_semaphore && !use_dynamic_split) {
-      // If varlen we'll manually do the zero-ing
-      tile_count_semaphore =
-          paddle::full(tile_count_semaphore.shape(), int32_t{0},
-                       paddle::DataType::INT32, place);
     }
     params_handle->tile_count_semaphore = scheduler_needs_semaphore
                                               ? const_cast<int *>(tile_count_semaphore.data<int>())
