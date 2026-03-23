@@ -227,6 +227,7 @@ class PipelineTmaAsync(PipelineTmaAsyncOg):
         state: PipelineState,
         try_acquire_token: Optional[Boolean] = None,
         extra_tx_count: int = 0,
+        **kwargs,
     ):
         """
         TMA producer commit conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
@@ -241,7 +242,7 @@ class PipelineTmaAsync(PipelineTmaAsyncOg):
             tx_count = self.sync_object_full.tx_count + extra_tx_count
             self.sync_object_full.arrive_and_expect_tx(state.index, tx_count)
 
-    def consumer_release(self, state: PipelineState):
+    def consumer_release(self, state: PipelineState, **kwargs):
         """
         TMA consumer release conditionally signals the empty buffer to the producer.
         """
@@ -300,10 +301,10 @@ class PipelineTmaUmma(PipelineTmaUmmaOg):
         producer = (producer_type, producer_group)
         consumer = (consumer_type, consumer_group)
 
-        sync_object_full = PipelineAsync._make_sync_object(
+        sync_object_full = PipelineTmaUmmaOg._make_sync_object(
             barrier_storage.align(min_align=8), num_stages, producer, tx_count
         )
-        sync_object_empty = PipelineAsync._make_sync_object(
+        sync_object_empty = PipelineTmaUmmaOg._make_sync_object(
             barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
         )
 
@@ -344,6 +345,7 @@ class PipelineTmaUmma(PipelineTmaUmmaOg):
         state: PipelineState,
         try_acquire_token: Optional[Boolean] = None,
         extra_tx_count: int = 0,
+        **kwargs,
     ):
         """
         TMA producer commit conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
