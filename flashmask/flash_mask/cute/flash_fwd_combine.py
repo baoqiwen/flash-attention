@@ -14,6 +14,7 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass import Float32, Int32, const_expr
 
 from flash_mask.cute import utils
+from flash_mask.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_mask.cute.seqlen_info import SeqlenInfo
 from cutlass.cute import FastDivmodDivisor
 
@@ -216,8 +217,7 @@ class FlashAttentionForwardCombine:
             raise ValueError("LSE tensor must have 2 or 3 dimensions: (batch, seqlen, nheads) or (total_q, nheads)")
 
         # Assume all strides are divisible by 128 bits except the last stride
-        new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
-        mO_partial, mO = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) for t in (mO_partial, mO)]
+        mO_partial, mO = [assume_tensor_aligned(t) for t in (mO_partial, mO)]
         # (num_splits, b, seqlen, h, d) -> (seqlen, d, num_splits, h, b)
         # or (num_splits, total_q, h, d) -> (total_q, d, num_splits, h)
         O_partial_layout_transpose = [2, 4, 0, 3, 1] if const_expr(cu_seqlens is None) else [1, 3, 0, 2]

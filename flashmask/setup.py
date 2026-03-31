@@ -97,7 +97,7 @@ install_requires = ['typing_extensions']
 if BUILD_FA4:
     install_requires += [
         'nvidia-cutlass==4.2.0.0',
-        'nvidia-cutlass-dsl==4.4.1',
+        'nvidia-cutlass-dsl==4.4.2',
     ]
 
 # ============================================================

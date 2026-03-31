@@ -15,6 +15,7 @@ from cutlass import Float32, Int32
 import cutlass.utils as utils_basic
 
 from flash_mask.cute import ampere_helpers as sm80_utils
+from flash_mask.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_mask.cute import utils
 from flash_mask.cute.mask import AttentionMask
 from flash_mask.cute.seqlen_info import SeqlenInfoQK
@@ -383,9 +384,9 @@ class FlashAttentionBackwardSm80:
         # Get the data type and check if it is fp16 or bf16
         self._check_type(*(t.element_type if t is not None else None
                            for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)))
-        # Assume all strides are divisible by 128 bits except the last stride
-        new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
-        mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) if t is not None else None for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV)]
+        mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV = [
+            assume_tensor_aligned(t) for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV)
+        ]
         self.varlen_q = (mCuSeqlensQ is not None)
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
