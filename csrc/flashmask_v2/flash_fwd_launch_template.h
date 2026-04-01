@@ -23,6 +23,10 @@
 #include "epilogue_fwd.hpp"
 #include "flash_mask.hpp"
 
+#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+#include "distributed/overlap_comm.cuh"
+#endif
+
 using namespace cute;
 
 template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
@@ -86,6 +90,74 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>,
         flash::enable_sm80_to_sm89<flash::FlashAttnFwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>>
     >;
+    int scaled_seqlen_k = params.seqlen_k;
+    int overlap_sm_margin = 0;
+#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+    bool need_overlap_comm = false;
+    if (params.nranks > 1) {
+        if constexpr (Varlen) {
+            throw std::runtime_error("Overlap Communicator currently does not support Varlen.");
+        }
+        if (params.d != params.dv) {
+            throw std::runtime_error("Overlap Communicator currently does not support D != Dv. KV should have the same D.");
+        }
+        if (params.seqlen_k % kBlockN) {
+            throw std::runtime_error("AttnBlock size should perfectly divided seqlen_k. This constraint will be removed in the future.");
+        }
+
+        bool is_first_init = flashmask::comm::is_singleton_null();
+        // init_singleton_instance handles both first-time creation and dynamic reconfiguration
+        auto& comm_singleton = flashmask::comm::init_singleton_instance(
+            (const Element*) params.k_ptr,
+            (const Element*) params.v_ptr,
+            params.b,
+            params.seqlen_k,
+            params.h_k,
+            params.d,
+            params.rank,
+            params.nranks,
+            params.unique_id_ptr,
+            params.h_flashmask
+        );
+
+        if (!is_first_init) {
+            // Non-first call: wait for SR buffer to be released by previous computation
+            comm_singleton.wait_sr_buffer_empty();
+        }
+        comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.lt_end_ptr, params.ut_start_ptr, params.ut_end_ptr, stream, true /* fwd */);
+        comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr);     // copy new KV data
+        need_overlap_comm = true;
+    }
+
+    if constexpr (Arch >= 90) {
+        // setting scheduler tile_count_semaphore / zeroing write_ptr / record write_ptr ready event
+        overlap_sm_margin = need_overlap_comm ? flashmask::comm::singleton().overlap_sm_margin() : 0;
+        prepare_flashmask(params, stream, params.num_sm - overlap_sm_margin, Scheduler::pipelining, 
+            need_overlap_comm ? &flashmask::comm::singleton().wptr_init : nullptr,
+            need_overlap_comm ? flashmask::comm::singleton().get_block_cnt_semaphore() : nullptr);
+    }
+
+    if (need_overlap_comm) {
+        auto& comm_singleton = flashmask::comm::singleton();
+        comm_singleton.wait_wptr_init();        // wait until wptr is initialized
+        comm_singleton.run_overlap_ag_kernel(params.write_ptr, scaled_seqlen_k);
+        // Note(heqianyue): if we don't use a cudaStreamSync at the end of update_kv_buffer, for team_bar
+        // the comm_stream itself might get blocked so comp_stream will load all the CTAs on the SMs, causing a deadlock.
+        // This is also true for semaphore syncs: we cannot take the risks of SMs being fully occupied.
+        // So no matter what, in this circumstance we need to make sure comm kernels occupies part of the SMs first.
+        comm_singleton.wait_reset_stream_coordinator(stream);
+        params.k_batch_stride *= params.nranks;
+        params.v_batch_stride *= params.nranks;
+        // `run_overlap_ag_kernel` is async. Then, re-route the KV data to the nvshmem_alloc SR buffer.
+        // After `run_overlap_ag_kernel`, the seqlen_k & k_batch_stride & v_batch_stride is no longer local, but local_length * nranks
+        params.k_ptr = comm_singleton.k_data();
+        params.v_ptr = comm_singleton.v_data();
+    }
+#else
+    if constexpr (Arch >= 90) {
+        prepare_flashmask(params, stream, params.num_sm, Scheduler::pipelining);
+    }
+#endif  // NVSHMEM_DISTRIBUTED_OVERLAP
 
     bool const is_varlen_q = params.cu_seqlens_q;
     bool const is_varlen_k = params.cu_seqlens_k;
@@ -98,16 +170,14 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             make_stride(params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0),
             make_stride(_1{}, params.v_dim_stride, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0));
 
-    if constexpr (Is_flashmask) {
-        flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream, true);
-    }
+    flash::flashmask::prepare_block_maxmin<kBlockN>(params, scaled_seqlen_k, stream, true);
 
     typename CollectiveMainloop::Arguments mainloop_args {
         static_cast<Element const*>(params.q_ptr),
         {seqlen_q, params.d, params.h, batch_q},  // shape_Q
         {params.q_row_stride, _1{}, params.q_head_stride, !is_varlen_q ? params.q_batch_stride : 0},  // stride_Q
         static_cast<Element*>(params.k_ptr),
-        {!params.page_table ? (!is_varlen_k ? params.seqlen_k : params.total_k) : params.page_size,
+        {!params.page_table ? (!is_varlen_k ? scaled_seqlen_k : params.total_k) : params.page_size,
          params.d, params.h_k, !params.page_table ? batch_k : params.num_pages},  // shape_K
         {params.k_row_stride, _1{}, params.k_head_stride, !is_varlen_k ? params.k_batch_stride : 0},  // stride_K
         static_cast<Element*>(params.v_ptr),
@@ -121,14 +191,14 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         static_cast<Element const*>(params.qv_ptr),
         {params.qv_row_stride, _1{}, params.qv_head_stride, !is_varlen_q ? params.qv_batch_stride : 0},  // stride_Qv
         static_cast<Element const*>(params.rotary_cos_ptr),
-        {params.seqlen_k, params.rotary_dim / 2},  // shape_rotary, the seqlen shape doesn't matter
+        {scaled_seqlen_k, params.rotary_dim / 2},  // shape_rotary, the seqlen shape doesn't matter
         {params.rotary_dim / 2, _1{}},  // stride_rotary_cos
         static_cast<Element const*>(params.rotary_sin_ptr),
         {params.rotary_dim / 2, _1{}},  // stride_rotary_sin
         params.is_rotary_interleaved,
         params.page_table,
         // if page_size is not set, avoid dividing by zero
-        {params.kv_batch_idx ? params.b_k : params.b, !params.page_table ? 0 : params.seqlen_k / params.page_size}, // shape_page_table
+        {params.kv_batch_idx ? params.b_k : params.b, !params.page_table ? 0 : scaled_seqlen_k / params.page_size}, // shape_page_table
         {params.page_table_batch_stride, _1{}},  // stride_page_table
         params.scale_softmax,
         params.q_descale_ptr, params.k_descale_ptr, params.v_descale_ptr,
@@ -151,7 +221,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.ut_start_nblockmax, params.ut_start_nblockmin,
         params.ut_end_nblockmax, params.ut_end_nblockmin,
         params.m_block_dim,params.n_block_dim,
-        params.block_mask_ptr
+        params.block_mask_ptr,
+        params.write_ptr,
+        params.seqlen_k
     };
 
     typename CollectiveEpilogue::Arguments epilogue_args {
@@ -168,10 +240,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.cu_seqlens_q, params.seqused_q
     };
 
-    if constexpr (Arch >= 90) {
-        prepare_preemptive_scheduler(params, stream, params.num_sm, Scheduler::pipelining);
-    }
-
     int qhead_per_khead = !PackGQA ? 1 : cutlass::ceil_div(params.h, params.h_k);
     int num_blocks_m = cutlass::ceil_div(params.seqlen_q * qhead_per_khead, get<0>(TileShape_MNK{}));
     num_blocks_m = cutlass::round_up(num_blocks_m, size<0>(ClusterShape{}));
@@ -179,7 +247,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         num_blocks_m, !PackGQA ? params.h : params.h_k, params.b, params.num_splits,
         params.h / params.h_k,
         params.seqlen_q,
-        params.seqlen_k, params.d, params.dv, sizeof(Element),
+        scaled_seqlen_k, params.d, params.dv, sizeof(Element),
         params.tile_count_semaphore, params.cu_seqlens_q, params.seqused_q,
         // params.num_m_blocks_ptr,
         params.num_splits_dynamic_ptr,
@@ -193,16 +261,14 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     int device;
     CHECK_CUDA(cudaGetDevice(&device));
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
-        mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
+        mainloop_args, epilogue_args, {device, params.num_sm - overlap_sm_margin}, scheduler_args
     });
+    CHECK_CUDA(cudaGetLastError());
 
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
     dim3 block_dims = AttnKernel::get_block_shape();
     int smem_size = AttnKernel::SharedStorageSize;
-    // int smem_size_q = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_q));
-    // int smem_size_k = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_k));
-    // int smem_size_v = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v));
-    // printf("smem_size = %d, q = %d, k = %d, v = %d\n", smem_size, smem_size_q, smem_size_k, smem_size_v);
+
     // Get the ptr to kernel function.
     if constexpr (size(ClusterShape{}) > 1) {
         void const* kernel = (void const*) flash::cutlass_flashmask_kernel<AttnKernel>;
@@ -221,6 +287,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                            Arch >= 90 && Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation /*launch_with_pdl*/);
     }
     CHECK_CUDA_KERNEL_LAUNCH();
+#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+    if (need_overlap_comm) flashmask::comm::singleton().set_sr_usable(stream);
+#endif  // NVSHMEM_DISTRIBUTED_OVERLAP
 }
 
 template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
