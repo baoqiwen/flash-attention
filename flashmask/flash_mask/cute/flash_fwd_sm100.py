@@ -103,7 +103,6 @@ class FlashAttentionForwardSm100:
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
     ):
-
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -151,13 +150,6 @@ class FlashAttentionForwardSm100:
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
         self.s0_s1_barrier = False
-        self.overlap_sO_sQ = (
-            (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
-            (self.head_dim_v_padded >= 128 and self.is_split_kv)
-        )
-        self.overlap_sO_sQ = True
-        if self.overlap_sO_sQ:
-            self.is_persistent = False
 
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
             "Paged KV does not support irregular head dim"
@@ -242,7 +234,7 @@ class FlashAttentionForwardSm100:
         """
 
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128:
-            self.kv_stage = 2
+            self.kv_stage = 2 if self.enable_flashmask else 3
         elif self.q_dtype.width == 8 or self.q_stage == 1:
             self.kv_stage = 4
         else:
@@ -307,6 +299,7 @@ class FlashAttentionForwardSm100:
         self.has_lt_end = const_expr(flashmask_info is not None and flashmask_info.LTE_nblock_max is not None)
         self.has_ut_start = const_expr(flashmask_info is not None and flashmask_info.UTS_nblock_max is not None)
         self.has_ut_end = const_expr(flashmask_info is not None and flashmask_info.UTE_nblock_max is not None)
+
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
@@ -582,17 +575,24 @@ class FlashAttentionForwardSm100:
             vO_layout = cute.make_layout((1, async_copy_elems))
             gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
 
+        self.overlap_sO_sQ = (
+            (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
+            (self.head_dim_v_padded >= 128 and self.is_split_kv)
+        )
+        if const_expr(self.enable_flashmask):
+            self.overlap_sO_sQ = True
+        if const_expr(self.overlap_sO_sQ):
+            self.is_persistent = False
+
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
+        elif const_expr(self.is_causal or self.is_local):
+            TileScheduler = SingleTileLPTScheduler
+        elif const_expr(self.is_persistent):
+            TileScheduler = StaticPersistentTileScheduler
         else:
-            if const_expr(self.is_causal or self.is_local):
-                TileScheduler = SingleTileLPTScheduler
-            else:
-                TileScheduler = (
-                    SingleTileScheduler
-                    if const_expr(not self.is_persistent)
-                    else StaticPersistentTileScheduler
-                )
+            TileScheduler = SingleTileScheduler
+
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mQ.shape[0]), self.cta_tiler[0]),
             cute.size(mQ.shape[2]),
@@ -677,13 +677,25 @@ class FlashAttentionForwardSm100:
             # Smem tensors
             # store row max and row sum
             sScale: cute.struct.MemRange[Float32, self.q_stage * self.m_block_size * 2]
-            s_startend_row_indices: cute.struct.MemRange[Int32, 4 * self.n_block_size * self.kv_stage]
+
+            s_startend_row_indices_size = 0
+            s_startend_row_indices_block_max_min_size = 0
+            s_n_block_size = 0
+            s_extra_flags_size = 0
+
+            if const_expr(self.enable_flashmask):
+                s_startend_row_indices_size = 4 * self.n_block_size * self.kv_stage
+                s_startend_row_indices_block_max_min_size = 8 * self.generate_block_buffer_block_count * self.generate_block_stage
+                s_n_block_size = self.generate_block_buffer_block_count * self.generate_block_stage
+                s_extra_flags_size = 4
+
+            s_startend_row_indices: cute.struct.MemRange[Int32, s_startend_row_indices_size]
             s_startend_row_indices_block_max_min: cute.struct.Align[
-                cute.struct.MemRange[Int32, 8 * self.generate_block_buffer_block_count * self.generate_block_stage],
+                cute.struct.MemRange[Int32, s_startend_row_indices_block_max_min_size],
                 128,
             ]
-            s_n_block: cute.struct.MemRange[Int32, self.generate_block_buffer_block_count * self.generate_block_stage]
-            s_extra_flags: cute.struct.MemRange[Int32, 4] # TODO(wusiming): would it be better to alloc more space to s_n_block?
+            s_n_block: cute.struct.MemRange[Int32, s_n_block_size]
+            s_extra_flags: cute.struct.MemRange[Int32, s_extra_flags_size] # TODO(wusiming): would it be better to alloc more space to s_n_block?
 
         self.shared_storage = SharedStorage
 
@@ -923,7 +935,6 @@ class FlashAttentionForwardSm100:
         pipeline_kv = self.make_and_init_load_kv_pipeline(mbar_ptr + self.mbar_load_kv_full_offset)
 
         #  Generate smem tensor Q/K/V/O
-        # (MMA, MMA_Q, MMA_D, PIPE)
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         # (MMA, MMA_K, MMA_D, PIPE)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
@@ -1004,18 +1015,24 @@ class FlashAttentionForwardSm100:
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
 
         # prepare input for generate_block
-        s_startend_row_indices_block_max_min = storage.s_startend_row_indices_block_max_min.get_tensor(
-            cute.make_layout(8 * self.generate_block_buffer_block_count * self.generate_block_stage),
-        )
-        s_n_block = storage.s_n_block.get_tensor(
-            cute.make_layout(self.generate_block_buffer_block_count * self.generate_block_stage),
-        )
-        s_extra_flags = storage.s_extra_flags.get_tensor(
-            cute.make_layout(4),
-        )
-        s_startend_row_indices = storage.s_startend_row_indices.get_tensor(
-            cute.make_layout(4 * self.n_block_size * self.kv_stage),
-        )
+        if const_expr(self.enable_flashmask):
+            s_startend_row_indices_block_max_min = storage.s_startend_row_indices_block_max_min.get_tensor(
+                cute.make_layout(8 * self.generate_block_buffer_block_count * self.generate_block_stage),
+            )
+            s_n_block = storage.s_n_block.get_tensor(
+                cute.make_layout(self.generate_block_buffer_block_count * self.generate_block_stage),
+            )
+            s_extra_flags = storage.s_extra_flags.get_tensor(
+                cute.make_layout(4),
+            )
+            s_startend_row_indices = storage.s_startend_row_indices.get_tensor(
+                cute.make_layout(4 * self.n_block_size * self.kv_stage),
+            )
+        else:
+            s_startend_row_indices_block_max_min = None
+            s_n_block = None
+            s_extra_flags = None
+            s_startend_row_indices = None
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  EMPTY
