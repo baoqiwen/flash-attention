@@ -23,17 +23,17 @@ import cutlass.cute as cute
 from cutlass import Float32, const_expr
 from cutlass.cutlass_dsl import Arch, BaseDSL
 
-from quack import copy_utils, layout_utils
+from flash_mask.flash_attn_v4 import copy_utils
+from flash_mask.flash_attn_v4 import layout_utils
 
-from flash_attn.cute import utils
-from flash_attn.cute.seqlen_info import SeqlenInfo
-from quack.cute_dsl_utils import ParamsBase
-from flash_attn.cute.tile_scheduler import (
+from flash_mask.flash_attn_v4 import utils
+from flash_mask.flash_attn_v4.seqlen_info import SeqlenInfo
+from flash_mask.flash_attn_v4.cute_dsl_utils import ParamsBase
+from flash_mask.flash_attn_v4.tile_scheduler import (
     SingleTileScheduler,
     SingleTileVarlenScheduler,
     TileSchedulerArguments,
 )
-
 
 class FlashAttentionBackwardPreprocess:
     def __init__(

@@ -14,15 +14,15 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass import Float32, Int32
 import cutlass.utils as utils_basic
 
-from quack import layout_utils
-from flash_attn.cute import ampere_helpers as sm80_utils
-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute import utils
-from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from quack.cute_dsl_utils import ParamsBase
-from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
-from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_mask.flash_attn_v4 import layout_utils
+from flash_mask.flash_attn_v4 import ampere_helpers as sm80_utils
+from flash_mask.flash_attn_v4.cute_dsl_utils import assume_tensor_aligned
+from flash_mask.flash_attn_v4 import utils
+from flash_mask.flash_attn_v4.mask import AttentionMask
+from flash_mask.flash_attn_v4.seqlen_info import SeqlenInfoQK
+from flash_mask.flash_attn_v4.cute_dsl_utils import ParamsBase
+from flash_mask.flash_attn_v4.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
+from flash_mask.flash_attn_v4.block_sparsity import BlockSparseTensors
 
 
 class FlashAttentionBackwardSm80:

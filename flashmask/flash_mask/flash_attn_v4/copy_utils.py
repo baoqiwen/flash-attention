@@ -90,19 +90,21 @@ def tiled_copy_1d(
 
 
 def tiled_copy_2d(
-    dtype: Type[cutlass.Numeric], major_mode_size: int, num_threads: int, is_async: bool = False
+    dtype: Type[cutlass.Numeric],
+    threads_per_row: int,
+    num_threads: int,
+    num_copy_elems: int = 1,
+    is_async: bool = False,
 ) -> cute.TiledCopy:
-    num_copy_bits = math.gcd(major_mode_size, 128 // dtype.width) * dtype.width
-    copy_elems = num_copy_bits // dtype.width
+    num_copy_bits = num_copy_elems * dtype.width
     copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
     copy_atom = cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
-    gmem_threads_per_row = major_mode_size // copy_elems
-    assert num_threads % gmem_threads_per_row == 0
+    assert num_threads % threads_per_row == 0
     thr_layout = cute.make_ordered_layout(
-        (num_threads // gmem_threads_per_row, gmem_threads_per_row),
+        (num_threads // threads_per_row, threads_per_row),
         order=(1, 0),
     )
-    val_layout = cute.make_layout((1, copy_elems))
+    val_layout = cute.make_layout((1, num_copy_elems))
     return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
 

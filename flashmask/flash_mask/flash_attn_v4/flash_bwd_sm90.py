@@ -12,29 +12,29 @@ from cutlass.cute import FastDivmodDivisor
 from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
-from quack import copy_utils
-from quack import layout_utils
-from quack import sm90_utils
-from quack.sm90_utils import gemm_zero_init, gemm_w_idx
+from flash_mask.flash_attn_v4 import copy_utils
+from flash_mask.flash_attn_v4 import layout_utils
+from flash_mask.flash_attn_v4 import hopper_helpers as sm90_utils
+from flash_mask.flash_attn_v4.hopper_helpers import gemm_zero_init, gemm_w_idx
 
-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute import utils
-from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute import pipeline
-from quack.cute_dsl_utils import ParamsBase
-from flash_attn.cute.tile_scheduler import (
+from flash_mask.flash_attn_v4.cute_dsl_utils import assume_tensor_aligned
+from flash_mask.flash_attn_v4 import utils
+from flash_mask.flash_attn_v4.mask import AttentionMask
+from flash_mask.flash_attn_v4.seqlen_info import SeqlenInfoQK
+from flash_mask.flash_attn_v4.block_info import BlockInfo
+from flash_mask.flash_attn_v4 import pipeline
+from flash_mask.flash_attn_v4.cute_dsl_utils import ParamsBase
+from flash_mask.flash_attn_v4.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     SingleTileLPTBwdScheduler,
     SingleTileVarlenScheduler,
 )
-from flash_attn.cute import barrier
-from flash_attn.cute.named_barrier import NamedBarrierBwd
-from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
-from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.block_sparse_utils import (
+from flash_mask.flash_attn_v4 import barrier
+from flash_mask.flash_attn_v4.named_barrier import NamedBarrierBwd
+from flash_mask.flash_attn_v4.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
+from flash_mask.flash_attn_v4.block_sparsity import BlockSparseTensors
+from flash_mask.flash_attn_v4.block_sparse_utils import (
     get_total_q_block_count_bwd,
     produce_block_sparse_q_loads_bwd_sm90,
     consume_block_sparse_mma_bwd_sm90,

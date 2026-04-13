@@ -20,20 +20,20 @@ import cutlass.utils as utils_basic
 from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
-from quack import copy_utils
-from quack import layout_utils
+from flash_mask.flash_attn_v4 import copy_utils
+from flash_mask.flash_attn_v4 import layout_utils
 
-from flash_attn.cute import ampere_helpers as sm80_utils
-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute import utils
-from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
-from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.pack_gqa import PackGQA
-from flash_attn.cute.named_barrier import NamedBarrierFwd
-from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
+from flash_mask.flash_attn_v4 import ampere_helpers as sm80_utils
+from flash_mask.flash_attn_v4.cute_dsl_utils import assume_tensor_aligned
+from flash_mask.flash_attn_v4 import utils
+from flash_mask.flash_attn_v4.mask import AttentionMask
+from flash_mask.flash_attn_v4.softmax import Softmax, apply_score_mod_inner
+from flash_mask.flash_attn_v4.seqlen_info import SeqlenInfoQK
+from flash_mask.flash_attn_v4.block_info import BlockInfo
+from flash_mask.flash_attn_v4.pack_gqa import PackGQA
+from flash_mask.flash_attn_v4.named_barrier import NamedBarrierFwd
+from flash_mask.flash_attn_v4.block_sparsity import BlockSparseTensors
+from flash_mask.flash_attn_v4.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
 
 
 class FlashAttentionForwardBase:
@@ -1224,6 +1224,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
 # SM90 forward pass moved to flash_fwd_sm90.py; re-export for backward compatibility
 def __getattr__(name):
     if name == "FlashAttentionForwardSm90":
-        from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
+        from flash_mask.flash_attn_v4.flash_fwd_sm90 import FlashAttentionForwardSm90
         return FlashAttentionForwardSm90
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

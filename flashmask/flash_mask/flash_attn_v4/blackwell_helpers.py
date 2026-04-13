@@ -7,7 +7,7 @@ from cutlass import Int32, Boolean, const_expr
 from cutlass.cute.nvgpu import tcgen05
 from cutlass._mlir.dialects import llvm
 
-import flash_attn.cute.mma_sm100_desc as sm100_desc
+import flash_mask.flash_attn_v4.mma_sm100_desc as sm100_desc
 
 
 @cute.jit

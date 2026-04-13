@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import os
 from typing import Type, Callable, Optional, Tuple, overload
+from functools import partial
 
 import cutlass
 import cutlass.cute as cute
@@ -15,8 +16,15 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
 
-
-import quack.activation
+fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
+mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
+add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
+sub_packed_f32x2 = partial(
+    cute.arch.calc_packed_f32x2_op,
+    src_c=None,
+    calc_func=nvvm.sub_packed_f32x2,
+    rnd=nvvm.RoundingModeKind.RN
+)
 
 _MIXER_ATTRS = ("__vec_size__",)
 
@@ -254,6 +262,17 @@ def get_smem_store_atom(
             cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=transpose, num_matrices=4),
             element_type,
         )
+
+
+def select(a: cute.Tensor, mode: list[int]) -> cute.Tensor:
+    return cute.make_tensor(a.iterator, cute.select(a.layout, mode))
+
+
+def transpose_view(a: cute.Tensor) -> cute.Tensor:
+    """Transpose the first two dimensions of a tensor on smem."""
+    shape = (a.shape[1], a.shape[0], *a.shape[2:])
+    order = (1, 0, *range(2, cute.rank(a)))
+    return cute.composition(a, cute.make_ordered_layout(shape, order=order))
 
 
 @cute.jit
@@ -727,10 +746,10 @@ def ex2_emulation_2(
     xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm")
     # The integer floor of x & y are now in the last 8 bits of xy_rounded
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
-    xy_rounded_back = quack.activation.sub_packed_f32x2(
+    xy_rounded_back = sub_packed_f32x2(
         xy_rounded, (fp32_round_int, fp32_round_int)
     )
-    xy_frac = quack.activation.sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
     xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, POLY_EX2[poly_degree], loc=loc, ip=ip)
     x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
     y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)

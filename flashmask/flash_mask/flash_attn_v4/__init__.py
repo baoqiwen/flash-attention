@@ -14,7 +14,7 @@ from .interface import (
     flash_attn_varlen_func,
 )
 
-from flash_attn.cute.cute_dsl_utils import cute_compile_patched
+from flash_mask.flash_attn_v4.cute_dsl_utils import cute_compile_patched
 
 # Patch cute.compile to optionally dump SASS
 cute.compile = cute_compile_patched

@@ -31,31 +31,32 @@ from cutlass.utils import ClcDynamicPersistentTileScheduler
 from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
-from quack import copy_utils, layout_utils
+from flash_mask.flash_attn_v4 import copy_utils
+from flash_mask.flash_attn_v4 import layout_utils
 
-from flash_attn.cute.paged_kv import PagedKVManager
-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute import utils
-import flash_attn.cute.pipeline as pipeline_custom
+from flash_mask.flash_attn_v4.paged_kv import PagedKVManager
+from flash_mask.flash_attn_v4.cute_dsl_utils import assume_tensor_aligned
+from flash_mask.flash_attn_v4 import utils
+import flash_mask.flash_attn_v4.pipeline as pipeline_custom
 import cutlass.pipeline as cutlass_pipeline
-from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
-from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.block_sparse_utils import (
+from flash_mask.flash_attn_v4.mask import AttentionMask
+from flash_mask.flash_attn_v4.softmax import SoftmaxSm100, apply_score_mod_inner
+from flash_mask.flash_attn_v4.seqlen_info import SeqlenInfoQK
+from flash_mask.flash_attn_v4.block_info import BlockInfo
+from flash_mask.flash_attn_v4.block_sparsity import BlockSparseTensors
+from flash_mask.flash_attn_v4.block_sparse_utils import (
     get_total_block_count,
     produce_block_sparse_loads_sm100,
     softmax_block_sparse_sm100,
     handle_block_sparse_empty_tile_correction_sm100,
 )
-from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
-from flash_attn.cute import mma_sm100_desc as sm100_desc
-from flash_attn.cute import blackwell_helpers as sm100_utils
-from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
+from flash_mask.flash_attn_v4.pack_gqa import PackGQA, pack_gqa_layout
+from flash_mask.flash_attn_v4 import mma_sm100_desc as sm100_desc
+from flash_mask.flash_attn_v4 import blackwell_helpers as sm100_utils
+from flash_mask.flash_attn_v4.named_barrier import NamedBarrierFwdSm100
 from cutlass.cute import FastDivmodDivisor
-from quack.cute_dsl_utils import ParamsBase
-from flash_attn.cute.tile_scheduler import (
+from flash_mask.flash_attn_v4.cute_dsl_utils import ParamsBase
+from flash_mask.flash_attn_v4.tile_scheduler import (
     ClcState,
     SchedulingMode,
     TileSchedulerArguments,
@@ -65,8 +66,8 @@ from flash_attn.cute.tile_scheduler import (
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
 )
-from flash_attn.cute.fa_logging import fa_log, fa_printf
-from flash_attn.cute.utils import smid
+from flash_mask.flash_attn_v4.fa_logging import fa_log, fa_printf
+from flash_mask.flash_attn_v4.utils import smid
 
 # === TUNING KNOBS (agent-editable) ===
 # Keys: (use_2cta_instrs: bool, is_causal: bool, head_dim_padded: int, is_sm103: bool)
@@ -2633,7 +2634,7 @@ class FlashAttentionForwardSm100:
         tiled_smem_store = cute.make_tiled_copy_D(smem_copy_atom, tiled_tmem_load)
 
         tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
-        tOsO_s2r = copy_utils.partition_D_position_independent(thr_tmem_load, tOsO_i[(None, None), None])
+        tOsO_s2r = thr_tmem_load.partition_D(tOsO_i[(None, None), None])
         tOcO_t2r = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
         for i in cutlass.range(self.head_dim_v_padded // corr_tile_size, unroll_full=True):
             tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
@@ -2675,7 +2676,7 @@ class FlashAttentionForwardSm100:
         cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_v_padded))
         tOcO = gmem_thr_copy_O.partition_S(cO)
         t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
-        tOpO = copy_utils.predicate_k(tOcO, limit=mO_cur.shape[1])
+        tOpO = utils.predicate_k(tOcO, limit=mO_cur.shape[1])
         pack_gqa = PackGQA(
             self.m_block_size,
             self.head_dim_v_padded,

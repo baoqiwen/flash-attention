@@ -28,7 +28,6 @@ dependencies = [
     "typing_extensions",
     "apache-tvm-ffi>=0.1.5,<0.2",
     "torch-c-dlpack-ext",
-    "quack-kernels>=0.3.3",
 ]
 
 [project.optional-dependencies]
@@ -44,8 +43,8 @@ Homepage = "https://github.com/Dao-AILab/flash-attention"
 Repository = "https://github.com/Dao-AILab/flash-attention"
 
 [tool.setuptools]
-packages = ["flash_attn.cute"]
-package-dir = {"flash_attn.cute" = "."}
+packages = ["flash_mask.flash_attn_v4"]
+package-dir = {"flash_mask.flash_attn_v4" = "."}
 
 [tool.setuptools_scm]
 root = "../.."

@@ -17,10 +17,10 @@ from cutlass import Int32, const_expr
 from cutlass.cute import FastDivmodDivisor
 from cutlass.utils import ClcDynamicPersistentTileScheduler, ClcDynamicPersistentTileSchedulerParams
 
-from quack.cute_dsl_utils import ParamsBase
+from flash_mask.flash_attn_v4.cute_dsl_utils import ParamsBase
 
-import flash_attn.cute.utils as utils
-from flash_attn.cute.fast_math import clz
+import flash_mask.flash_attn_v4.utils as utils
+from flash_mask.flash_attn_v4.fast_math import clz
 
 
 class SchedulingMode(IntEnum):

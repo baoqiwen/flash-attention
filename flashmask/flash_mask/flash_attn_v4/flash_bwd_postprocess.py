@@ -14,17 +14,16 @@ from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass import Float32, const_expr
 from cutlass.utils import LayoutEnum
 
-from quack import copy_utils
-from quack import layout_utils
-from quack import sm90_utils
+from flash_mask.flash_attn_v4 import copy_utils
+from flash_mask.flash_attn_v4 import hopper_helpers as sm90_utils
 
-from flash_attn.cute import utils
-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute import ampere_helpers as sm80_utils
-from flash_attn.cute.seqlen_info import SeqlenInfoQK
+from flash_mask.flash_attn_v4 import utils
+from flash_mask.flash_attn_v4.cute_dsl_utils import assume_tensor_aligned
+from flash_mask.flash_attn_v4 import ampere_helpers as sm80_utils
+from flash_mask.flash_attn_v4.seqlen_info import SeqlenInfoQK
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
-from quack.cute_dsl_utils import ParamsBase
-from flash_attn.cute.tile_scheduler import (
+from flash_mask.flash_attn_v4.cute_dsl_utils import ParamsBase
+from flash_mask.flash_attn_v4.tile_scheduler import (
     SingleTileScheduler,
     SingleTileVarlenScheduler,
     TileSchedulerArguments,
@@ -318,7 +317,7 @@ class FlashAttentionBackwardPostprocess:
                 cute.recast_ptr(sdQaccum.iterator, sdQ_layout.inner, dtype=self.dtype),
                 sdQ_layout.outer,
             )[None, None, 0]
-        sdQt = layout_utils.transpose_view(sdQ)
+        sdQt = utils.transpose_view(sdQ)
 
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()

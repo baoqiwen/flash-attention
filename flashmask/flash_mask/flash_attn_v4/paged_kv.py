@@ -6,8 +6,8 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 from cutlass import Int32, const_expr
 
-from flash_attn.cute import utils
-from quack.cute_dsl_utils import ParamsBase
+from flash_mask.flash_attn_v4 import utils
+from flash_mask.flash_attn_v4.cute_dsl_utils import ParamsBase
 from cutlass.cute import FastDivmodDivisor
 
 import math

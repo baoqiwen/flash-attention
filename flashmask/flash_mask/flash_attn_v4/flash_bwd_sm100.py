@@ -14,29 +14,28 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync
 
-import quack.activation
-from quack import layout_utils
-from flash_attn.cute import utils
-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute import copy_utils
-from flash_attn.cute import pipeline
-from flash_attn.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
-from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from flash_attn.cute.block_info import BlockInfo
-from quack.cute_dsl_utils import ParamsBase
-from flash_attn.cute.tile_scheduler import (
+from flash_mask.flash_attn_v4 import utils
+from flash_mask.flash_attn_v4 import utils
+from flash_mask.flash_attn_v4.cute_dsl_utils import assume_tensor_aligned
+from flash_mask.flash_attn_v4 import copy_utils
+from flash_mask.flash_attn_v4 import pipeline
+from flash_mask.flash_attn_v4.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
+from flash_mask.flash_attn_v4.mask import AttentionMask
+from flash_mask.flash_attn_v4.seqlen_info import SeqlenInfoQK
+from flash_mask.flash_attn_v4.block_info import BlockInfo
+from flash_mask.flash_attn_v4.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     SingleTileLPTBwdScheduler,  # noqa
     SingleTileVarlenScheduler,
+    ParamsBase,
 )
 
-from flash_attn.cute import barrier
-from flash_attn.cute.named_barrier import NamedBarrierBwdSm100
-from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
-from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.block_sparse_utils import (
+from flash_mask.flash_attn_v4 import barrier
+from flash_mask.flash_attn_v4.named_barrier import NamedBarrierBwdSm100
+from flash_mask.flash_attn_v4.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
+from flash_mask.flash_attn_v4.block_sparsity import BlockSparseTensors
+from flash_mask.flash_attn_v4.block_sparse_utils import (
     get_total_q_block_count_bwd,
     get_block_sparse_iteration_info_bwd,
     get_m_block_from_iter_bwd,
@@ -492,15 +491,15 @@ class FlashAttentionBackwardSm100:
 
         # (b, s, n, h) --> (s, h, n, b) or (t, n, h) -> (t, h, n)
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
-        mQ, mdO = [layout_utils.select(t, mode=QO_layout_transpose) for t in (mQ, mdO)]
+        mQ, mdO = [utils.select(t, mode=QO_layout_transpose) for t in (mQ, mdO)]
 
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
-        mK, mV = [layout_utils.select(t, mode=KV_layout_transpose) for t in (mK, mV)]
+        mK, mV = [utils.select(t, mode=KV_layout_transpose) for t in (mK, mV)]
 
         # (b, n, s) --> (s, n, b) or (n, t) --> (t, n)
         LSE_dPsum_dQaccum_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
         mLSE, mdPsum, mdQaccum = [
-            layout_utils.select(t, mode=LSE_dPsum_dQaccum_transpose)
+            utils.select(t, mode=LSE_dPsum_dQaccum_transpose)
             for t in (mLSE, mdPsum, mdQaccum)
         ]
 
@@ -508,10 +507,10 @@ class FlashAttentionBackwardSm100:
             layout_dKV_transpose = KV_layout_transpose
         else:
             layout_dKV_transpose = [2, 1, 0] if const_expr(mCuSeqlensK is None) else [1, 0]
-        mdK, mdV = [layout_utils.select(t, mode=layout_dKV_transpose) for t in (mdK, mdV)]
+        mdK, mdV = [utils.select(t, mode=layout_dKV_transpose) for t in (mdK, mdV)]
         # (s, h, n, b) --> (h, s, n, b) or (t, h, n) -> (h, t, b)
         dO_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensQ is None) else [1, 0, 2]
-        mdO = layout_utils.select(mdO, mode=dO_transpose)
+        mdO = utils.select(mdO, mode=dO_transpose)
 
         # Transposes for 2-CTA K/Q paths (Q follows Q seqlens, K follows K seqlens)
         transpose_sh_q = dO_transpose
@@ -521,13 +520,13 @@ class FlashAttentionBackwardSm100:
         semaphore_transpose = [2, 3, 1, 0]
         if const_expr(self.deterministic):
             assert mdQ_semaphore is not None
-            mdQ_semaphore = layout_utils.select(mdQ_semaphore, mode=semaphore_transpose)
+            mdQ_semaphore = utils.select(mdQ_semaphore, mode=semaphore_transpose)
 
         if const_expr(self.deterministic and self.qhead_per_kvhead > 1):
             assert mdK_semaphore is not None
             assert mdV_semaphore is not None
             mdK_semaphore, mdV_semaphore = [
-                layout_utils.select(t, mode=semaphore_transpose)
+                utils.select(t, mode=semaphore_transpose)
                 for t in (mdK_semaphore, mdV_semaphore)
             ]
         else:
@@ -651,7 +650,7 @@ class FlashAttentionBackwardSm100:
         if const_expr(self.use_2cta_instrs):
             tma_atom_dOt, tma_tensor_dOt = cute.nvgpu.make_tiled_tma_atom_B(
                 dO_tma_op,
-                layout_utils.select(mdO, mode=transpose_sh_q),
+                utils.select(mdO, mode=transpose_sh_q),
                 cute.select(self.sdOt_layout, mode=[0, 1, 2]),
                 self.mma_tiler_vdo,
                 self.tiled_mma_dP,
@@ -661,7 +660,7 @@ class FlashAttentionBackwardSm100:
         if const_expr(self.use_2cta_instrs):
             tma_atom_Qt, tma_tensor_Qt = cute.nvgpu.make_tiled_tma_atom_B(
                 Q_tma_op,
-                layout_utils.select(mQ, mode=transpose_sh_q),
+                utils.select(mQ, mode=transpose_sh_q),
                 cute.select(self.sQt_layout, mode=[0, 1, 2]),
                 self.mma_tiler_dsq,
                 self.tiled_mma_dK,
@@ -674,7 +673,7 @@ class FlashAttentionBackwardSm100:
             )
             tma_atom_Kt, tma_tensor_Kt = cute.nvgpu.make_tiled_tma_atom_B(
                 Kt_tma_op,
-                layout_utils.select(mK, mode=transpose_sh_k),
+                utils.select(mK, mode=transpose_sh_k),
                 cute.select(self.sKt_layout, mode=[0, 1, 2]),
                 self.mma_tiler_dsk,
                 self.tiled_mma_dQ,
@@ -2868,8 +2867,8 @@ class FlashAttentionBackwardSm100:
         )
         # if const_expr(self.SdP_swapAB):
         if const_expr(True):
-            sLSE_2D = layout_utils.transpose_view(sLSE_2D)
-            sdPsum_2D = layout_utils.transpose_view(sdPsum_2D)
+            sLSE_2D = utils.transpose_view(sLSE_2D)
+            sdPsum_2D = utils.transpose_view(sdPsum_2D)
 
         # tix: [128...384]  8 warps
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())  # 4-11
@@ -3175,7 +3174,7 @@ class FlashAttentionBackwardSm100:
                                 utils.shuffle_sync(tSrdPsum, offset=2 * v + 1),
                             )
                         tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = (
-                            quack.activation.sub_packed_f32x2(
+                            utils.sub_packed_f32x2(
                                 (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
                             )
                         )

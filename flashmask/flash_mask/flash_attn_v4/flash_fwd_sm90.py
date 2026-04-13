@@ -17,27 +17,27 @@ from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.base_dsl.arch import Arch
 
-from quack import copy_utils
-from quack import layout_utils
-from quack import sm90_utils
+from flash_mask.flash_attn_v4 import copy_utils
+from flash_mask.flash_attn_v4 import layout_utils
+from flash_mask.flash_attn_v4 import hopper_helpers as sm90_utils
 
-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute import utils
-from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
-from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.block_sparse_utils import (
+from flash_mask.flash_attn_v4.cute_dsl_utils import assume_tensor_aligned
+import flash_mask.flash_attn_v4.utils as utils
+from flash_mask.flash_attn_v4.mask import AttentionMask
+from flash_mask.flash_attn_v4.softmax import Softmax, apply_score_mod_inner
+from flash_mask.flash_attn_v4.seqlen_info import SeqlenInfoQK
+from flash_mask.flash_attn_v4.block_info import BlockInfo
+from flash_mask.flash_attn_v4.block_sparsity import BlockSparseTensors
+from flash_mask.flash_attn_v4.block_sparse_utils import (
     produce_block_sparse_loads,
     consume_block_sparse_loads,
 )
-from flash_attn.cute import pipeline as pipeline_custom
-from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout, make_packgqa_tiled_tma_atom
-from flash_attn.cute.paged_kv import PagedKVManager
-from flash_attn.cute.named_barrier import NamedBarrierFwd
-from quack.cute_dsl_utils import ParamsBase
-from flash_attn.cute.tile_scheduler import (
+from flash_mask.flash_attn_v4 import pipeline as pipeline_custom
+from flash_mask.flash_attn_v4.pack_gqa import PackGQA, pack_gqa_layout, make_packgqa_tiled_tma_atom
+from flash_mask.flash_attn_v4.paged_kv import PagedKVManager
+from flash_mask.flash_attn_v4.named_barrier import NamedBarrierFwd
+from flash_mask.flash_attn_v4.cute_dsl_utils import ParamsBase
+from flash_mask.flash_attn_v4.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     SingleTileLPTScheduler,
@@ -45,7 +45,7 @@ from flash_attn.cute.tile_scheduler import (
 )
 from cutlass.cute import FastDivmodDivisor
 
-from flash_attn.cute.flash_fwd import FlashAttentionForwardBase
+from flash_mask.flash_attn_v4.flash_fwd import FlashAttentionForwardBase
 
 
 class FlashAttentionForwardSm90(FlashAttentionForwardBase):
@@ -192,12 +192,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
-        mQ, mO = [layout_utils.select(t, QO_layout_transpose) for t in (mQ, mO)]
+        mQ, mO = [utils.select(t, QO_layout_transpose) for t in (mQ, mO)]
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
-        mK, mV = [layout_utils.select(t, KV_layout_transpose) for t in (mK, mV)]
+        mK, mV = [utils.select(t, KV_layout_transpose) for t in (mK, mV)]
         LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
         mLSE = (
-            layout_utils.select(mLSE, LSE_layout_transpose)
+            utils.select(mLSE, LSE_layout_transpose)
             if const_expr(mLSE is not None)
             else None
         )
@@ -526,7 +526,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 sV_layout.outer, swizzle=sV_layout.inner, dtype=mV.element_type
             )
         # Transpose view of V to tensor with layout (head_dim_v, tile_n) for tiled mma
-        sVt = layout_utils.transpose_view(sV)
+        sVt = utils.transpose_view(sV)
         sP = None
         if const_expr(sP_layout is not None):
             sP = storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
@@ -1223,7 +1223,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 else:  # Each thread might have a different sink value due to different q_head
                     sink_val = cute.make_rmem_tensor_like(softmax.row_max, Float32)
                     cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
-                    tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma_qk.partition_C(cS))
+                    tScS_mn = utils.make_acc_tensor_mn_view(thr_mma_qk.partition_C(cS))
                     for r in cutlass.range(cute.size(sink_val), unroll_full=True):
                         row = m_block * self.tile_m + tScS_mn[r][0]
                         q_head_idx = row % self.qhead_per_kvhead + head_idx * self.qhead_per_kvhead
@@ -1368,7 +1368,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mask_fn(acc_S=acc_S, n_block=n_block)
 
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
-        # if cute.arch.thread_idx()[0] == 0: cute.print_tensor(layout_utils.reshape_acc_to_mn(acc_S))
+        # if cute.arch.thread_idx()[0] == 0: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
         tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
         tOrP_cur = (
             tOrP
@@ -1436,7 +1436,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
         if const_expr(mask_fn is not None):
             mask_fn(acc_S=acc_S, n_block=n_block)
-        # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(layout_utils.reshape_acc_to_mn(acc_S))
+        # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
 
         row_scale = softmax.online_softmax(acc_S, check_inf=check_inf)
         warpgroup.wait_group(0)
