@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+
 # SM90 (Hopper) forward pass for flash attention, extracted from flash_fwd.py.
 
 from types import SimpleNamespace

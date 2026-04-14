@@ -1,3 +1,5 @@
+# Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+
 # Supported features:
 # - BF16 & FP16 dtype
 # - noncausal & causal attention

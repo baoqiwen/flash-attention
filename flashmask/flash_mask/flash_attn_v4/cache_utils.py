@@ -1,3 +1,5 @@
+# Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+
 # Manage Ahead-of-Time (AOT) compiled kernels
 import fcntl
 import hashlib
@@ -15,7 +17,10 @@ import ctypes
 
 import cutlass
 import cutlass.cute as cute
-import tvm_ffi
+try:
+    import tvm_ffi
+except ImportError:
+    tvm_ffi = None
 from cutlass.cutlass_dsl import JitCompiledFunction
 from flash_mask.flash_attn_v4.fa_logging import fa_log
 
@@ -28,7 +33,7 @@ for _lib_path in cute.runtime.find_runtime_libraries(enable_tvm_ffi=False):
         ctypes.CDLL(_lib_path, mode=ctypes.RTLD_GLOBAL)
 
 CompileKeyType: TypeAlias = tuple[Hashable, ...]
-CallableFunction: TypeAlias = JitCompiledFunction | tvm_ffi.Function
+CallableFunction: TypeAlias = JitCompiledFunction  # tvm_ffi.Function also accepted at runtime
 
 
 # Enable cache via `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1`
@@ -66,7 +71,7 @@ def _compute_source_fingerprint() -> str:
 
     h.update(f"py{sys.version_info.major}.{sys.version_info.minor}".encode())
     h.update(f"cutlass={cutlass.__version__}".encode())
-    h.update(f"tvm_ffi={tvm_ffi.__version__}".encode())
+    h.update(f"tvm_ffi={tvm_ffi.__version__ if tvm_ffi else 'N/A'}".encode())
 
     for src in sorted(cute_root.rglob("*.py")):
         if not src.is_file():

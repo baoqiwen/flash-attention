@@ -1,3 +1,4 @@
+# Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 # Copyright (c) 2025, Tri Dao.
 
 from typing import Optional

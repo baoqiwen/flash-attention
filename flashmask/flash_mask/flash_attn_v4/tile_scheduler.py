@@ -1,4 +1,4 @@
-# Copyright (c) 2025, Tri Dao.
+# Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 
 from enum import IntEnum, auto
 from typing import Optional, Tuple, Protocol, runtime_checkable

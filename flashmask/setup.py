@@ -25,7 +25,7 @@
 # 
 # How to use fa4 varlen based on Torch:
 #   FLASH_ATTN_BACKEND=paddle pip install -e . --no-build-isolation (default)
-#   FLASH_ATTN_BACKEND=torch  pip install -e . --no-build-isolation
+#   FLASH_ATTN_BACKEND=torch  pip install -e . --no-build-isolation (TODO)
 #
 # Build wheel for distribution:
 #   python setup.py bdist_wheel
@@ -52,6 +52,14 @@ print(f"[flashmask] FLASHMASK_BUILD={FLASHMASK_BUILD}  "
       f"BUILD_FA3={BUILD_FA3}  BUILD_FA4={BUILD_FA4}")
 
 # ============================================================
+# Config
+# ============================================================
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+FLASH_MASK_DIR = os.path.join(ROOT_DIR, 'flash_mask')
+FA_V3_DIR = os.path.join(FLASH_MASK_DIR, 'flashmask_attention_v3')
+INST_DIR = os.path.join(FA_V3_DIR, 'instantiations')
+
+# ============================================================
 # Backend selection: bake FLASH_ATTN_BACKEND into _backend.py
 # at install time so interface.py needs no runtime env-var lookup.
 # ============================================================
@@ -68,14 +76,6 @@ with open(_backend_py, 'w') as _f:
     _f.write(f"BACKEND = {FLASH_ATTN_BACKEND!r}\n")
 print(f"[flashmask] FLASH_ATTN_BACKEND={FLASH_ATTN_BACKEND!r}  "
       f"→ written to {_backend_py}")
-
-# ============================================================
-# Config
-# ============================================================
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-FLASH_MASK_DIR = os.path.join(ROOT_DIR, 'flash_mask')
-FA_V3_DIR = os.path.join(FLASH_MASK_DIR, 'flashmask_attention_v3')
-INST_DIR = os.path.join(FA_V3_DIR, 'instantiations')
 
 _BASE_VERSION = '4.0.0'
 
@@ -120,6 +120,7 @@ if BUILD_FA4:
     install_requires += [
         'nvidia-cutlass==4.2.0.0',
         'nvidia-cutlass-dsl==4.4.1',
+        "apache-tvm-ffi >= 0.1.5, < 0.2.0",
     ]
 
 # ============================================================

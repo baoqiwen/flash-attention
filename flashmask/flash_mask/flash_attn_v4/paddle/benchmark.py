@@ -1,4 +1,5 @@
-# Copyright (c) 2023, Tri Dao.
+# Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+
 """Useful functions for writing benchmark/test code (Paddle backend)."""
 
 import time

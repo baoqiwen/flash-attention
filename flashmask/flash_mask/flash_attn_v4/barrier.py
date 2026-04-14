@@ -1,3 +1,5 @@
+# Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32
