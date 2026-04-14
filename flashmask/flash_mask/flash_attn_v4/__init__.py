@@ -9,12 +9,21 @@ except PackageNotFoundError:
 
 import cutlass.cute as cute
 
-from .interface import (
-    flash_attn_func,
-    flash_attn_varlen_func,
-)
+# Auto-detect framework: prefer torch, fall back to paddle.
+try:
+    import torch  # noqa: F401
 
-from flash_mask.flash_attn_v4.cute_dsl_utils import cute_compile_patched
+    from flash_mask.flash_attn_v4.torch.interface import (
+        flash_attn_func,
+        flash_attn_varlen_func,
+    )
+    from flash_mask.flash_attn_v4.torch.cute_dsl_utils import cute_compile_patched
+except ImportError:
+    from flash_mask.flash_attn_v4.paddle.interface import (
+        flash_attn_func,
+        flash_attn_varlen_func,
+    )
+    from flash_mask.flash_attn_v4.paddle.cute_dsl_utils import cute_compile_patched
 
 # Patch cute.compile to optionally dump SASS
 cute.compile = cute_compile_patched

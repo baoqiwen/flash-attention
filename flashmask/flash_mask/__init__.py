@@ -69,6 +69,15 @@ try:
 except ImportError:
     pass  # cute module not installed or dependencies missing
 
+# ============================================================
+# FA4 varlen / standard interface (framework-routed)
+# ============================================================
+try:
+    from .interface import flash_attn_func, flash_attn_varlen_func, flash_attn_combine
+    __all__ += ["flash_attn_func", "flash_attn_varlen_func", "flash_attn_combine"]
+except ImportError:
+    pass
+
 if not _fa3_available and not _fa4_available:
     print("[WARNING] flash_mask: neither FA3 nor FA4 is available. "
           "Check your installation.")
