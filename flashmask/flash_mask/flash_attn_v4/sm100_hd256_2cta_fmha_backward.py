@@ -9,6 +9,8 @@ Constraints:
 * Batch size must be the same for Q, K, and V tensors
 """
 
+from typing import Optional
+
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -213,7 +215,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
         dQ_semaphore: cute.Tensor | None = None,
         dK_semaphore: cute.Tensor | None = None,
         dV_semaphore: cute.Tensor | None = None,
-        aux_tensors: tuple[cute.Tensor] | None = None,
+        aux_tensors: Optional[list] = None,
         block_sparse_tensors: cute.Tensor | None = None,
         stream: cuda.CUstream = None,
     ):
