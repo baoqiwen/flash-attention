@@ -15,6 +15,16 @@
 __all__ = []
 
 # ============================================================
+# Resolve backend (compile-time, no runtime env-var)
+# ============================================================
+try:
+    from flash_mask._backend import BACKEND as _backend_name
+except ImportError:
+    # No _backend.py (source checkout without pip install).
+    # Default to paddle (matches setup.py default).
+    _backend_name = 'paddle'
+
+# ============================================================
 # FA3: C++/CUDA compiled extension (requires paddle + .so)
 # ============================================================
 _fa3_available = False
@@ -59,15 +69,28 @@ except ImportError:
     pass  # paddle not installed, skip FA3
 
 # ============================================================
-# FA4: Pure Python + CUTLASS DSL (no .so needed)
+# FA4: Paddle-only high-level interfaces (flash_attention / flashmask_attention)
+# Only imported when paddle backend is active.
 # ============================================================
 _fa4_available = False
+if _backend_name == 'paddle':
+    try:
+        from .cute import flash_attention, flashmask_attention
+        __all__ += ["flash_attention", "flashmask_attention"]
+        _fa4_available = True
+    except ImportError:
+        pass  # cute module not installed or dependencies missing
+else:
+    _fa4_available = True  # torch backend: no Paddle-specific ops needed
+
+# ============================================================
+# FA4 varlen / standard interface (framework-routed via _backend.py)
+# ============================================================
 try:
-    from .cute import flash_attention, flashmask_attention
-    __all__ += ["flash_attention", "flashmask_attention"]
-    _fa4_available = True
+    from .interface import flash_attn_func, flash_attn_varlen_func, flash_attn_combine
+    __all__ += ["flash_attn_func", "flash_attn_varlen_func", "flash_attn_combine"]
 except ImportError:
-    pass  # cute module not installed or dependencies missing
+    pass
 
 if not _fa3_available and not _fa4_available:
     print("[WARNING] flash_mask: neither FA3 nor FA4 is available. "
