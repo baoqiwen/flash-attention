@@ -60,7 +60,7 @@ def _compute_source_fingerprint() -> str:
     Hash all CuTe Python sources plus runtime ABI stamps into a short fingerprint.
 
     The fingerprint changes whenever:
-    - Any .py file under flash_attn/cute is added, removed, renamed, or modified.
+    - Any .py file under flash_mask/flash_attn_v4 is added, removed, renamed, or modified.
     - The Python minor version changes (e.g. 3.13 -> 3.14).
     - The cutlass or tvm_ffi package version changes.
 

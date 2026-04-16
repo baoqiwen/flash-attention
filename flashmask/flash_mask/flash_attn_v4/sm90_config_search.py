@@ -5,9 +5,9 @@ Enumerates tile sizes, swap modes, atom layouts, and staging options.
 Checks GMMA divisibility, register budget, and shared memory budget.
 
 Usage:
-    python flash_attn/cute/sm90_config_search.py --headdim 128
-    python flash_attn/cute/sm90_config_search.py --mode fwd --headdim 192-128
-    python flash_attn/cute/sm90_config_search.py --mode bwd --headdim 192 --tile-n 64,96
+    python flash_mask/flash_attn_v4/sm90_config_search.py --headdim 128
+    python flash_mask/flash_attn_v4/sm90_config_search.py --mode fwd --headdim 192-128
+    python flash_mask/flash_attn_v4/sm90_config_search.py --mode bwd --headdim 192 --tile-n 64,96
 """
 
 import math
