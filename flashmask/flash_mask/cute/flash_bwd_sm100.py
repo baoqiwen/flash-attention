@@ -2690,7 +2690,7 @@ class FlashAttentionBackwardSm100:
             else:
                 mdQ_semaphore_cur = None
 
-            delay_semaphore_release = self.is_causal
+            delay_semaphore_release = True
             n_block_global_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
 
             dQacc_reduce_step = partial(
@@ -2783,12 +2783,19 @@ class FlashAttentionBackwardSm100:
                                 mdQ_semaphore_cur[(m_block, None)].iterator, tidx, 0, lock_value
                             )
 
+                            # With delay_semaphore_release, the drain+fence was already
+                            # done at the end of dQacc_reduce_step before returning,
+                            # so we only need the arrive_inc here.
                             if const_expr(delay_semaphore_release):
                                 if m_block > m_block_min:
                                     barrier.arrive_inc(
                                         mdQ_semaphore_cur[(m_block - 1, None)].iterator, tidx, 0, 1
                                     )
                             else:
+                                if is_tma_warp:
+                                    cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                                cute.arch.fence_proxy(cute.arch.ProxyKind.async_global)
+                                cute.arch.fence_acq_rel_gpu()
                                 barrier.arrive_inc(mdQ_semaphore_cur[m_block, None].iterator, tidx, 0, 1)
 
                             if tidx == 0 and self.debug_print:
@@ -2804,6 +2811,8 @@ class FlashAttentionBackwardSm100:
 
             if is_tma_warp:
                 cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+            cute.arch.fence_proxy(cute.arch.ProxyKind.async_global)
+            cute.arch.fence_acq_rel_gpu()
             self.reduce_sync_barrier.arrive_and_wait()
             # final semaphore release
             if const_expr(self.deterministic and delay_semaphore_release):
@@ -2923,12 +2932,31 @@ class FlashAttentionBackwardSm100:
                 if m_block > m_block_min:
                     if tidx == 0 and self.debug_print:
                         cute.printf('n_block: %d, m_block: %d, stage: %d, lock_value: %d, reduce_step before barrier.arrive_inc in stage', n_block, m_block, stage, lock_value)
+                    # Explicitly drain ALL in-flight TMA reduces and fence them
+                    # into the generic proxy domain before releasing the semaphore
+                    # for the prior m_block.
+                    if is_tma_warp:
+                        cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                    cute.arch.fence_proxy(cute.arch.ProxyKind.async_global)
+                    cute.arch.fence_acq_rel_gpu()
+                    self.reduce_sync_barrier.arrive_and_wait()
                     barrier.arrive_inc(
                         mdQ_semaphore_cur[(m_block - 1, None)].iterator, tidx, 0, 1
                     )
                     if tidx == 0 and self.debug_print:
                         cute.printf('n_block: %d, m_block: %d, stage: %d, lock_value: %d, reduce_step after barrier.arrive_inc in stage', n_block, m_block, stage, lock_value)
     
+        # For delay_semaphore_release: drain all remaining TMA ops and fence
+        # them into the generic proxy domain BEFORE returning, so that the
+        # full_mask path in the caller can safely release the semaphore for
+        # the prior m_block without needing its own drain+fence sequence.
+        if const_expr(self.deterministic and delay_semaphore_release):
+            if is_tma_warp:
+                cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+            cute.arch.fence_proxy(cute.arch.ProxyKind.async_global)
+            cute.arch.fence_acq_rel_gpu()
+            self.reduce_sync_barrier.arrive_and_wait()
+
         # semaphore release
         # NOTE: arrive_inc calls red_release which issues membar
         if const_expr(self.deterministic and not delay_semaphore_release):
@@ -2936,6 +2964,10 @@ class FlashAttentionBackwardSm100:
                 cute.printf('n_block: %d, m_block: %d, reduce_step before barrier.arrive_inc', n_block, m_block)
             if is_tma_warp:
                 cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+            # Fence TMA writes (async proxy) into the generic proxy domain so
+            # that the subsequent red.release on the semaphore orders after them.
+            cute.arch.fence_proxy(cute.arch.ProxyKind.async_global)
+            cute.arch.fence_acq_rel_gpu()
             self.reduce_sync_barrier.arrive_and_wait()
             barrier.arrive_inc(mdQ_semaphore_cur[m_block, None].iterator, tidx, 0, 1)
             if tidx == 0 and self.debug_print:
