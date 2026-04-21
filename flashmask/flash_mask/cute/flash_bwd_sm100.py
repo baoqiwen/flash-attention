@@ -859,7 +859,9 @@ class FlashAttentionBackwardSm100:
 
         if warp_idx == 1:
             cute.arch.mbarrier_init(
-                tmem_dealloc_mbar_ptr, cute.arch.WARP_SIZE * len(self.compute_warp_ids)
+                tmem_dealloc_mbar_ptr,
+                cute.arch.WARP_SIZE
+                * (len(self.compute_warp_ids) + len(self.reduce_warp_ids)),
             )
             cute.arch.mbarrier_init(
                 flashmask_loaded_mbar_ptr, cute.arch.WARP_SIZE
@@ -1237,6 +1239,10 @@ class FlashAttentionBackwardSm100:
                 sFM_max_min,
                 flashmask_loaded_mbar_ptr,
             )
+            # Reduce warp must also arrive on tmem_dealloc_mbar, otherwise the
+            # MMA warp can dealloc TMEM while the reduce warp is still reading
+            # dQ via T2R (races under GPU preemption).
+            cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
 
         return
 
