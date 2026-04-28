@@ -3952,6 +3952,7 @@ class FlashAttentionBackwardSm100:
                 mdQ_semaphore_cur=mdQ_semaphore_cur,
                 stage_offset=stage_offset,
                 dQaccum_empty_mbar_ptr=dQaccum_empty_mbar_ptr,
+                block_info=block_info,
             )
 
             if const_expr(self.enable_flashmask):
@@ -4008,12 +4009,8 @@ class FlashAttentionBackwardSm100:
                                     cute.printf('n_block: %d, m_block: %d, before reduce_step SKIPPPPPPP', n_block, m_block)
 
                                 if const_expr(self.spt):
-                                    n_block_max_for_m_block = min(
-                                        n_block_global_max,
-                                        cute.ceil_div(
-                                            (m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q,
-                                            self.tile_n,
-                                        ),
+                                    _, n_block_max_for_m_block = block_info.get_n_block_min_max(
+                                        seqlen, m_block
                                     )
                                     lock_value = n_block_max_for_m_block - 1 - n_block_cta_group
                                 else:
@@ -4082,6 +4079,7 @@ class FlashAttentionBackwardSm100:
         mdQ_semaphore_cur: Optional[cute.Tensor],
         stage_offset: cute.Int32,
         dQaccum_empty_mbar_ptr: Optional[cute.Pointer],
+        block_info: BlockInfo,
     ):
         num_reduce_threads = cute.arch.WARP_SIZE * len(self.reduce_warp_ids)
         tidx = cute.arch.thread_idx()[0] % num_reduce_threads
@@ -4122,12 +4120,8 @@ class FlashAttentionBackwardSm100:
             # semaphore acquire
             if const_expr(self.deterministic and stage == 0):
                 if const_expr(self.spt):
-                    n_block_max_for_m_block = min(
-                        n_block_global_max,
-                        cute.ceil_div(
-                            (m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q,
-                            self.tile_n,
-                        ),
+                    _, n_block_max_for_m_block = block_info.get_n_block_min_max(
+                        seqlen, m_block
                     )
                     lock_value = n_block_max_for_m_block - 1 - n_block_cta_group
                 else:

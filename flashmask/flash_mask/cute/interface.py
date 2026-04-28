@@ -133,6 +133,10 @@ def _flash_attn_fwd(
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
     """
+
+    assert cu_seqlens_q is None, "cu_seqlens_q must be None (varlen is not supported in flashmask)"
+    assert cu_seqlens_k is None, "cu_seqlens_k must be None (varlen is not supported in flashmask)"
+
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
@@ -627,6 +631,8 @@ def _flash_attn_bwd(
 ) -> Tuple[paddle.Tensor, paddle.Tensor, paddle.Tensor]:
     compute_capability = paddle.device.cuda.get_device_capability()[0]
     assert compute_capability in [10], "Unsupported compute capability. Supported: 10.x"
+    assert cu_seqlens_q is None, "cu_seqlens_q must be None (varlen is not supported in flashmask)"
+    assert cu_seqlens_k is None, "cu_seqlens_k must be None (varlen is not supported in flashmask)"
 
     cute_flashmask_info = None
     num_flashmask_tensors = 0
