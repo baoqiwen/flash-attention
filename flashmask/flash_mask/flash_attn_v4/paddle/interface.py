@@ -83,9 +83,9 @@ def _swap_last_two_dims(t: paddle.Tensor) -> paddle.Tensor:
 
 
 def _dim_order(t: paddle.Tensor) -> tuple:
-    """Return dimension indices sorted by stride ascending, matching torch.Tensor.dim_order()."""
+    """Return dimension indices sorted by stride descending (outermost first), matching torch.Tensor.dim_order()."""
     strides = list(t.strides)
-    return tuple(sorted(range(len(strides)), key=lambda i: strides[i]))
+    return tuple(sorted(range(len(strides)), key=lambda i: strides[i], reverse=True))
 
 
 def _parse_arch_str(arch_str):
@@ -1826,11 +1826,12 @@ def flash_attn_varlen_func(
     softcap: float = 0.0,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
-    deterministic: bool = False,
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
 ):
+    deterministic = paddle.get_flags(["FLAGS_cudnn_deterministic"])["FLAGS_cudnn_deterministic"]
+
     return FlashAttnVarlenFunc.apply(
         q, k, v,
         cu_seqlens_q, cu_seqlens_k,
