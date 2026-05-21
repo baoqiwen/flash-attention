@@ -17,11 +17,13 @@
 #   FLASHMASK_BUILD=fa4   - FA4 only (pure Python + CUTLASS DSL, no paddle needed)
 #   FLASHMASK_BUILD=fa3   - FA3 only (CUDA kernels, requires paddle)
 #   FLASHMASK_BUILD=fla   - FLA only (Flash Linear Attention GDN/KDA ops)
-#   FLASHMASK_BUILD=all   - FA3 + FA4 + FLA (default, requires paddle)
+#   FLASHMASK_BUILD=cpb   - CP Balance only (CUDA kernels, requires paddle)
+#   FLASHMASK_BUILD=all   - FA3 + FA4 + FLA + CP Balance (default, requires paddle)
 #   Components can be combined with comma, plus, or whitespace separators.
 #
 # Examples:
 #   FLASHMASK_BUILD=fa4 pip install -e . --no-build-isolation
+#   FLASHMASK_BUILD=fa4,cpb pip install -e . --no-build-isolation
 #   FLASHMASK_BUILD=fla pip install -e . --no-build-isolation
 #   FLASHMASK_BUILD="fa3+fla" pip install -e . --no-build-isolation
 #   FLASHMASK_BUILD="fa3, fla" pip install -e . --no-build-isolation
@@ -50,21 +52,23 @@ from setuptools import setup as setuptools_setup, find_packages
 FLASHMASK_BUILD = os.environ.get('FLASHMASK_BUILD', 'all').lower()
 requested_components = set(re.split(r'[,\s+]+', FLASHMASK_BUILD.strip()))
 requested_components.discard('')
-ALLOWED_COMPONENTS = {'fa3', 'fa4', 'fla', 'all'}
+ALLOWED_COMPONENTS = {'fa3', 'fa4', 'fla', 'cpb', 'all'}
 invalid_components = requested_components - ALLOWED_COMPONENTS
 assert requested_components and not invalid_components, (
     f"Invalid FLASHMASK_BUILD component(s): {', '.join(sorted(invalid_components or requested_components))}. "
     f"Allowed: {', '.join(sorted(ALLOWED_COMPONENTS))}. "
-    f"Combinations e.g. 'fa3+fa4', 'fa3+fla', 'fa4+fla', 'fa3+fa4+fla'."
+    f"Combinations e.g. 'fa3+fa4', 'fa4+cpb', 'fa3+fla', 'fa4+fla', 'fa3+fa4+fla+cpb'."
 )
 
 _build_all = 'all' in requested_components
 BUILD_FA3 = _build_all or 'fa3' in requested_components
 BUILD_FA4 = _build_all or 'fa4' in requested_components
 BUILD_FLA = _build_all or 'fla' in requested_components
+BUILD_CPB = _build_all or 'cpb' in requested_components
 
 print(f"[flashmask] FLASHMASK_BUILD={FLASHMASK_BUILD}  "
-      f"BUILD_FA3={BUILD_FA3}  BUILD_FA4={BUILD_FA4}  BUILD_FLA={BUILD_FLA}")
+      f"BUILD_FA3={BUILD_FA3}  BUILD_FA4={BUILD_FA4}  "
+      f"BUILD_FLA={BUILD_FLA}  BUILD_CPB={BUILD_CPB}")
 if BUILD_FLA:
     print("[flashmask] Note: FLA (Flash Linear Attention) in flashmask currently only supports GDN and KDA operators.")
 
@@ -510,13 +514,14 @@ def _build_cuda_submodule(name, csrc_dir, pkg_dir):
 _submodule_package_data = {}
 
 # --- cp_balance: needs sm_80/sm_90a/sm_100 (multi-arch) ---
-_pkg = _build_cuda_submodule(
-    'CP Balance',
-    csrc_dir=os.path.join(FLASH_MASK_DIR, 'cp_balance', 'csrc'),
-    pkg_dir=os.path.join(FLASH_MASK_DIR, 'cp_balance'),
-)
-if _pkg:
-    _submodule_package_data[_pkg] = ['*.so']
+if BUILD_CPB:
+    _pkg = _build_cuda_submodule(
+        'CP Balance',
+        csrc_dir=os.path.join(FLASH_MASK_DIR, 'cp_balance', 'csrc'),
+        pkg_dir=os.path.join(FLASH_MASK_DIR, 'cp_balance'),
+    )
+    if _pkg:
+        _submodule_package_data[_pkg] = ['*.so']
 
 # To add future submodules, just repeat:
 #   _pkg = _build_cuda_submodule('Name', csrc_dir=..., pkg_dir=...)
