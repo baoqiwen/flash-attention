@@ -136,6 +136,11 @@ if not BUILD_FLA:
         'flash_mask.linear_attn',
         'flash_mask.linear_attn.*',
     ]
+if not BUILD_CPB:
+    exclude_packages += [
+        "flash_mask.cp_balance",
+        "flash_mask.cp_balance.*",
+    ]
 
 packages = find_packages(exclude=exclude_packages)
 
