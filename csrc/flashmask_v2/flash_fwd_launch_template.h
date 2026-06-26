@@ -92,6 +92,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     >;
     int scaled_seqlen_k = params.seqlen_k;
     int overlap_sm_margin = 0;
+    bool simulate_single_head_rdma = false;
 #ifdef NVSHMEM_DISTRIBUTED_OVERLAP
     bool need_overlap_comm = false;
     if (params.nranks > 1) {
@@ -124,12 +125,14 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.lt_end_ptr, params.ut_start_ptr, params.ut_end_ptr, stream, true /* fwd */);
         comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr);     // copy new KV data
         need_overlap_comm = true;
+        simulate_single_head_rdma = comm_singleton.use_bhsd_layout();
     }
 
     if constexpr (Arch >= 90) {
         // setting scheduler tile_count_semaphore / zeroing write_ptr / record write_ptr ready event
         overlap_sm_margin = need_overlap_comm ? flashmask::comm::singleton().overlap_sm_margin() : 0;
-        prepare_flashmask(params, stream, params.num_sm - overlap_sm_margin, Scheduler::pipelining, 
+        if (need_overlap_comm) flashmask::comm::singleton().ensure_ag_done(stream);
+        prepare_flashmask(params, stream, params.num_sm - overlap_sm_margin, Scheduler::pipelining,
             need_overlap_comm ? &flashmask::comm::singleton().wptr_init : nullptr,
             need_overlap_comm ? flashmask::comm::singleton().get_block_cnt_semaphore() : nullptr);
     }
@@ -149,6 +152,13 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         // After `run_overlap_ag_kernel`, the seqlen_k & k_batch_stride & v_batch_stride is no longer local, but local_length * nranks
         params.k_ptr = comm_singleton.k_data();
         params.v_ptr = comm_singleton.v_data();
+        if (comm_singleton.use_bhsd_layout()) {
+            // SR buffer is (B, H, S_total, D): row_stride and head_stride swap
+            params.k_row_stride = params.d;                                     // D
+            params.k_head_stride = static_cast<int64_t>(scaled_seqlen_k) * params.d;  // S_total * D
+            params.v_row_stride = params.d;
+            params.v_head_stride = static_cast<int64_t>(scaled_seqlen_k) * params.d;
+        }
     }
 #else
     if constexpr (Arch >= 90) {
@@ -168,6 +178,17 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             make_stride(_1{}, params.v_dim_stride, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0));
 
     flash::flashmask::prepare_block_maxmin<kBlockN>(params, scaled_seqlen_k, stream, true);
+
+#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+    // DEBUG: check for CUDA errors before to_underlying_arguments
+    if (need_overlap_comm) {
+        cudaError_t dbg_err = cudaGetLastError();
+        if (dbg_err != cudaSuccess) {
+            fprintf(stderr, "[BHSD DEBUG] CUDA error BEFORE to_underlying_arguments: %s\n",
+                    cudaGetErrorString(dbg_err));
+        }
+    }
+#endif
 
     typename CollectiveMainloop::Arguments mainloop_args {
         static_cast<Element const*>(params.q_ptr),
@@ -220,7 +241,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.m_block_dim,params.n_block_dim,
         params.block_mask_ptr,
         params.write_ptr,
-        params.seqlen_k
+        params.seqlen_k,
+        simulate_single_head_rdma ? params.h_k : 1
     };
 
     typename CollectiveEpilogue::Arguments epilogue_args {

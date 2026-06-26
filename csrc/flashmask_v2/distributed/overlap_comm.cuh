@@ -3,6 +3,8 @@
 #include <string>
 #include "sr_buffer.cuh"
 #include "sep_sr_buffer.cuh"
+#include "hierarchical_rank_map.cuh"
+#include "overlap_feature_flags.cuh"
 #include "cutlass/bfloat16.h"
 
 namespace flashmask {
@@ -17,11 +19,12 @@ struct OverlapConfig {
     int D = 0;
     int nranks = 0;        // NVSHMEM-unsafe to change; kept for validation
     bool overlap_rs = false;
+    bool use_bhsd = false;     // SR buffer uses (B,H,S,D) layout instead of (B,S,H,D)
 
     bool operator==(const OverlapConfig& other) const {
         return B == other.B && S_local == other.S_local && H == other.H
             && H_mask == other.H_mask && D == other.D && nranks == other.nranks
-            && overlap_rs == other.overlap_rs;
+            && overlap_rs == other.overlap_rs && use_bhsd == other.use_bhsd;
     }
     bool operator!=(const OverlapConfig& other) const { return !(*this == other); }
 
@@ -39,7 +42,8 @@ struct OverlapConfig {
         return "B=" + std::to_string(B) + ", S_local=" + std::to_string(S_local)
             + ", H=" + std::to_string(H) + ", H_mask=" + std::to_string(H_mask)
             + ", D=" + std::to_string(D) + ", nranks=" + std::to_string(nranks)
-            + ", overlap_rs=" + std::to_string(int(overlap_rs));
+            + ", overlap_rs=" + std::to_string(int(overlap_rs))
+            + ", use_bhsd=" + std::to_string(int(use_bhsd));
     }
 };
 
@@ -159,12 +163,48 @@ public:
         return block_cnt_semaphore;
     }
 
+    // Ensure previous AG kernel on comm_stream has completed before comp_stream
+    // resets block_cnt_semaphore (via prepare_flashmask). Prevents race where
+    // block_cnt_semaphore is reset while the AG kernel is still using it.
+    void ensure_ag_done(cudaStream_t stream) {
+        cudaStreamWaitEvent(stream, ag_done);
+    }
+
+    // Per-work ready flag accessors for BWD compute kernel.
+    // work_done array = block_work_ids (bitmap region, 1-based indexing).
+    int* get_work_done_ptr() const {
+        return block_work_ids;
+    }
+
+    // row_per_block used by comm kernel = num_warps * RDMA_ROW_PER_WARP.
+    // Returns 0 if per-work mode should not be used.
+    int get_comm_rpb() const;
+
     int nranks() const {
         return _total_n_pes;
     }
 
     int s_local() const {
         return S_local;
+    }
+
+    int gpus_per_node() const {
+        return _gpus_per_node;
+    }
+    int my_pe_node() const {
+        return _my_pe_node;
+    }
+    int num_nodes() const {
+        return _num_nodes;
+    }
+    bool use_hierarchical() const {
+        return _flags.use_hierarchical;
+    }
+    bool use_bhsd_layout() const {
+        return _flags.use_bhsd_layout;
+    }
+    bool per_stage_buffer() const {
+        return _flags.per_stage_buffer;
     }
 
     // this function is only called in the bwd
@@ -175,12 +215,23 @@ public:
     int overlap_sm_margin() const;
     void prepare_dkv_buffer(cudaStream_t stream);
 
-    // wptr_init: comp_stream notifies comm_stream, write_ptr is usable
-    // sr_usable: comp_stream notifies comm_stream, KV SR buffer local chunk can be reused (since computation is done)
-    // bwd_done (only when RS-overlap): comp_stream notifies aux_streams, bwd post-proc done
-    // reduce_done (only when RS-overlap): aux_c_stream notifies comp_stream, dk/v recv buffer are released and ready
-    // local_moved (only when RS-overlap): for segment 0, aux_p_stream notifies aux_c_stream whether the memcpy d2d is completed.
-    cudaEvent_t wptr_init, sr_usable, bwd_done, reduce_done, local_moved;
+    // ── Cross-stream synchronization events ──────────────────────────────
+    //
+    //  Event          Direction                        Contract
+    //  ─────────────  ───────────────────────────────  ──────────────────────────────────────
+    //  wptr_init      comp_stream → comm_stream        write_ptr is initialized, AG kernel may start
+    //  sr_usable      comp_stream → comm_stream        Attention consumed local KV chunk, SR buffer reusable
+    //  ag_done        comm_stream → comp_stream        AG kernel finished; safe to reset block_cnt_semaphore
+    //  bwd_done       comp_stream → aux_{p,c}_stream   BWD post-proc done, dK/dV send buffers ready  (RS-overlap only)
+    //  reduce_done    aux_c_stream → comp_stream       dK/dV recv buffers released and ready          (RS-overlap only)
+    //  local_moved    aux_p_stream → aux_c_stream      Segment-0 local dKV memcpy d2d completed       (RS-overlap only)
+    //
+    cudaEvent_t wptr_init;
+    cudaEvent_t sr_usable;
+    cudaEvent_t ag_done;
+    cudaEvent_t bwd_done;       // RS-overlap only
+    cudaEvent_t reduce_done;    // RS-overlap only
+    cudaEvent_t local_moved;    // RS-overlap only
     /**
      * If overlap_rs is set, dkv_buffer will be populated.
      * and since the fwd AG buffer is always bigger than bwd AG
@@ -209,10 +260,19 @@ private:
         return kv_buffer->v_data() + _total_numel - B * _local_batch_stride;
     }
 
+    // Semaphore accessors for hierarchical dual-array protocol:
+    //   sema_inter [0..num_nodes-1]: cross-node data-ready flags (0/1)
+    //   sema_intra [0..total_n_pes-1]: refcount + intra-node consumption signals
+    // Non-hierarchical: sema_inter_size=0, sema_intra() == semaphores()
+    inline int64_t* sema_inter() const { return kv_buffer->semaphores(); }
+    inline int64_t* sema_intra() const { return kv_buffer->semaphores() + _sema_inter_size; }
+
     // Helper to (re)allocate block_work_ids and derived pointers
     void reallocate_block_work_ids();
     // Helper to create or recreate the dkv_buffer for RS-overlap
     void setup_dkv_buffer(bool need_rs, nvshmem_team_t cp_team);
+    // Prime per-stage RS semaphores so the first BWD's producer_wait_empty can proceed
+    void prime_rs_semaphores();
 
 private:
     std::unique_ptr<SRBuffer<KVType>> kv_buffer;
@@ -233,17 +293,44 @@ private:
     size_t _local_batch_stride;
     size_t _total_numel;
 
+    // Hierarchical overlap topology
+    int _gpus_per_node;     // Number of GPUs per node (from nvshmem_n_pes_node)
+    int _my_pe_node;        // This PE's index within its node (from nvshmem_team_my_pe)
+    int _num_nodes;         // Number of nodes (= _total_n_pes / _gpus_per_node)
+    OverlapFeatureFlags _flags;  // runtime feature switches (effective values after fallbacks)
+    int _sema_inter_size;   // num_nodes for hierarchical, 0 otherwise (offset into semaphore array)
+
     // Configuration tracking for dynamic reconfiguration
     OverlapConfig _config;
     size_t _sr_buffer_capacity;             // allocated SRBuffer numel capacity
     size_t _dkv_single_k_numel_capacity;    // allocated SepSRBuffer single_k_numel capacity
     int _dkv_num_chunks;                    // SepSRBuffer's chunks_per_seg (layout-defining)
     int _num_copy_chunks;                   // block_work_ids array size tracking
+    int _bitmap_region_size;                // bitmap region size (work_done + frontier)
 
+    // ── Compound device allocation (single cudaMalloc) ───────────────────
+    //
+    //  Offset (int elements)                       Field
+    //  ──────────────────────────────────────────   ──────────────────────────────
+    //  [0 .. bitmap_region)                        block_work_ids  (= work_done bitmap + frontier)
+    //  [bitmap_region .. bitmap_region+1)          block_cnt_semaphore
+    //  [bitmap_region+1 .. bitmap_region+1+N)      copy_chunk_mask  (N = _num_copy_chunks)
+    //  [bitmap_region+1+N .. bitmap_region+2+N)    stream_coordinator
+    //  [bitmap_region+2+N .. bitmap_region+2+2N)   rank_commit_counters  (RS-overlap: per-rank)
+    //  [bitmap_region+2+2N .. bitmap_region+2+3N)  rank_empty_counters   (RS-overlap: per-rank)
+    //
     int* block_work_ids;
     int* block_cnt_semaphore;
     int* copy_chunk_mask;
     int* stream_coordinator;        // make sure comm kernel is scheduled to GPU before computation kernel
+    int* rank_commit_counters;      // per-rank put completion counters for P2P RS commit
+    int* rank_empty_counters;       // per-rank get completion counters for P2P AG empty notify
+
+    // RS multi-stream: per-segment producer resources (USE_DYNAMIC_CAPACITY only)
+    cudaStream_t* put_streams;      // [num_segments], nullptr if single-stream
+    cudaEvent_t* bwd_done_events;   // [num_segments], nullptr if single-stream
+    int* rs_block_cnt;              // device memory [num_segments], nullptr if single-stream
+    int _num_put_streams;           // 0 = single-stream mode
 };
 
 namespace comm {
