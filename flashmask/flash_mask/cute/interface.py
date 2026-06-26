@@ -60,6 +60,83 @@ paddle2cute_dtype_map = {
 }
 
 
+# FA4 backward, head_dim=192 / head_dim_v=128: pick 2cta vs 1cta-split-dv per mask.
+#
+# Each N-block of an M-row falls into one of three categories:
+#   - full    : nothing masked   -> must be computed in full
+#   - partial : partially masked -> still computed, with a mask applied
+#   - empty   : entirely masked   -> can be skipped completely
+#
+# valid_block_count (V) = NON-empty blocks = full + partial.
+# S = blocks the 2cta kernel actually walks = full + partial + empty within the
+#     causal-structured region. 2cta does structured causal skip but does NOT skip
+#     flashmask-empty blocks (its two CTAs share pipeline stages, so both must walk
+#     the same set of N-blocks).
+# density  r = V / S = (full + partial) / (full + partial + empty)  in [0, 1].
+#
+# 2cta: ~2.4x higher peak, but pays for every empty block -> wins when dense.
+# 1cta: lower peak, but skips empty blocks (work == V)     -> wins when sparse.
+#   time_2cta ~ S/peak_2cta ,  time_1cta ~ V/peak_1cta
+#   2cta faster  <=>  V/S > peak_1cta/peak_2cta  <=>  r >= threshold.
+# Crossover ≈ peak_1cta / peak_2cta ≈ 0.42.
+#   r >= 0.42 -> dense  -> 2cta
+#   r < 0.42  -> sparse -> 1cta-split-dv
+_FA4_BWD_SPLIT_DV_DENSITY_THRESHOLD = 0.42
+
+
+def _bwd_2cta_total_block_count(seqlen_q, seqlen_k, kBlockM, kBlockN, causal):
+    """ blocks the 2cta kernel actually walks = full + partial + empty within the
+        causal-structured region. 2cta does structured causal skip but does NOT skip
+        flashmask-empty blocks (its two CTAs share pipeline stages, so both must walk
+        the same set of N-blocks)"""
+    M = (seqlen_q + kBlockM - 1) // kBlockM
+    N = (seqlen_k + kBlockN - 1) // kBlockN
+    if not causal:
+        return M * N
+    total = 0
+    for i in range(M):
+        row_idx_end = min((i + 1) * kBlockM, seqlen_q)
+        n_idx_right = row_idx_end + seqlen_k - seqlen_q
+        n_block_max_i = min(N, (n_idx_right + kBlockN - 1) // kBlockN)
+        if n_block_max_i > 0:
+            total += n_block_max_i
+    return total
+
+
+def _bwd_192x128_use_2cta(
+    cute_flashmask_info,
+    valid_block_count,
+    causal,
+    kBlockM,
+    kBlockN,
+    seqlen_q,
+    seqlen_k,
+    fm_b,
+    fm_h,
+):
+    """ FA4 backward, head_dim=192 / head_dim_v=128: pick 2cta vs 1cta-split-dv per mask.
+        Each N-block of an M-row falls into one of three categories:
+          - full    : nothing masked      -> must be computed in full
+          - partial : partially masked    -> still computed, with a mask applied
+          - empty   : entirely masked     -> can be skipped completely
+        V: counts the NON-empty blocks (= full + partial).
+        S: blocks the 2cta kernel actually walks = full + partial + empty within the
+           causal-structured region. 2cta does structured causal skip but does NOT skip
+           flashmask-empty blocks (its two CTAs share pipeline stages, so both must walk
+           the same set of N-blocks).
+        r = V / S = (full + partial) / (full + partial + empty)  in [0, 1].
+    """
+    reduce_block_count(cute_flashmask_info, causal, kBlockM, kBlockN, seqlen_q)
+
+    # full + partial
+    V = int(valid_block_count.sum().item())
+    # full + partial + empty, actually walks
+    S = _bwd_2cta_total_block_count(seqlen_q, seqlen_k, kBlockM, kBlockN, causal) * fm_b * fm_h
+    if S <= 0:
+        return True
+    return V / S >= _FA4_BWD_SPLIT_DV_DENSITY_THRESHOLD
+
+
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
     if num_n_blocks <= 4:
@@ -622,8 +699,23 @@ def _flash_attn_bwd(
     assert cu_seqlens_q is None, "cu_seqlens_q must be None (varlen is not supported in flashmask)"
     assert cu_seqlens_k is None, "cu_seqlens_k must be None (varlen is not supported in flashmask)"
 
+    num_head, head_dim = q.shape[-2:]
+    num_head_kv = k.shape[-2]
+    head_dim_v = v.shape[-1]
+    seqlen_q = q.shape[1]
+    seqlen_k = k.shape[1]
+
+    if compute_capability == 9:
+        m_block_size = 80 if not causal else 64
+        n_block_size = 128
+    else:
+        m_block_size = 128
+        n_block_size = 128
+
     cute_flashmask_info = None
     num_flashmask_tensors = 0
+    bwd_192x128_use_2cta = True
+
     if flashmask_info is not None and isinstance(flashmask_info, paddle.Tensor):
         flashmask_info = FlashMaskInfoPaddle(
             startend_row_indices=flashmask_info,
@@ -631,18 +723,35 @@ def _flash_attn_bwd(
         )
     if flashmask_info is not None:
         assert isinstance(flashmask_info, FlashMaskInfoPaddle)
+        compute_density = (
+            compute_capability == 10 and head_dim == 192 and head_dim_v == 128
+        )
+        if compute_density:
+            fm_b, fm_h = flashmask_info.startend_row_indices.shape[:2]
+            num_m_blocks = (seqlen_q + m_block_size - 1) // m_block_size
+            flashmask_info.valid_block_count = paddle.empty(
+                [fm_b, fm_h, num_m_blocks], dtype=paddle.int32
+            )
         prepare_block_maxmin(flashmask_info)
         cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
         num_flashmask_tensors = 2 * flashmask_info.startend_row_indices.shape[-1]
+        if compute_density:
+            bwd_192x128_use_2cta = _bwd_192x128_use_2cta(
+                cute_flashmask_info,
+                flashmask_info.valid_block_count,
+                causal,
+                m_block_size,
+                n_block_size,
+                seqlen_q,
+                seqlen_k,
+                fm_b,
+                fm_h,
+            )
 
-    num_head, head_dim = q.shape[-2:]
-    num_head_kv = k.shape[-2]
-    head_dim_v = v.shape[-1]
     is_split_d_bwd = False
+    is_split_dv_bwd = False
 
     if compute_capability == 9:
-        m_block_size = 80 if not causal else 64
-        n_block_size = 128
         num_stages_Q = 2
         num_stages_dO = 2
         num_stages_PdS = 2
@@ -654,16 +763,26 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = 1
         cluster_size = 1
     else:
-        m_block_size = 128
-        n_block_size = 128
         dQ_swapAB = False
         dKV_swapAB = False
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
 
-        is_split_d_bwd = head_dim > 192 and head_dim == head_dim_v
+        if head_dim == 256 and head_dim_v == 256:
+            is_split_d_bwd = True
+            is_split_dv_bwd = True
+        elif head_dim == 192 and head_dim_v == 128:
+            is_split_d_bwd = False
+            is_split_dv_bwd = not bwd_192x128_use_2cta
+        else:
+            is_split_d_bwd = False
+            is_split_dv_bwd = False
+
         need_large_cluster = (head_dim > 128) or (head_dim == 128 and flashmask_info is None)
-        cluster_size = 1 if is_split_d_bwd else (2 if need_large_cluster else 1)
+        if not (is_split_d_bwd or is_split_dv_bwd):
+            cluster_size = 2 if need_large_cluster else 1
+        else:
+            cluster_size = 1
         use_2cta_instrs = cluster_size == 2
 
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
@@ -754,7 +873,7 @@ def _flash_attn_bwd(
     # GQA-ratio==1 + not-split-d path the main bwd kernel writes dk/dv directly, and
     # FlashMask can skip whole n_blocks (no Q rows attend) — those rows would stay
     # garbage with empty_like and break correctness. Fall back to zeros_like there.
-    kv_postprocess_full = (qhead_per_kvhead > 1) or is_split_d_bwd
+    kv_postprocess_full = (qhead_per_kvhead > 1) or is_split_d_bwd or is_split_dv_bwd
     fixed_seqlen = cu_seqlens_q is None and cu_seqlens_k is None
     if fixed_seqlen:
         dq = paddle.empty_like(q)
@@ -781,7 +900,7 @@ def _flash_attn_bwd(
     dpsum = paddle.empty(shape=dpsum_shape, dtype=paddle.float32)
     lse_log2 = paddle.empty(shape=dpsum_shape, dtype=paddle.float32)
 
-    need_kv_accum = qhead_per_kvhead > 1 or is_split_d_bwd
+    need_kv_accum = qhead_per_kvhead > 1 or is_split_d_bwd or is_split_dv_bwd
     if need_kv_accum:
         if cu_seqlens_k is None:
             seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
@@ -852,7 +971,7 @@ def _flash_attn_bwd(
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
         for t in (dq_accum, dpsum, lse_log2)
     ]
-    if qhead_per_kvhead > 1 or is_split_d_bwd:
+    if qhead_per_kvhead > 1 or is_split_d_bwd or is_split_dv_bwd:
         dk_accum_tensor, dv_accum_tensor = [
             from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
             for t in (dk_accum, dv_accum)
@@ -870,7 +989,7 @@ def _flash_attn_bwd(
     else:
         dQ_semaphore = None
 
-    if deterministic and (qhead_per_kvhead > 1 or is_split_d_bwd):
+    if deterministic and (qhead_per_kvhead > 1 or is_split_d_bwd or is_split_dv_bwd):
         dK_semaphore = paddle.zeros(
             shape=[batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2], dtype=paddle.int32
         )
@@ -976,6 +1095,7 @@ def _flash_attn_bwd(
             cluster_size,
             deterministic,
             is_split_d_bwd if compute_capability == 10 else False,
+            is_split_dv_bwd if compute_capability == 10 else False,
         )
     num_threads = 384
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -1032,6 +1152,7 @@ def _flash_attn_bwd(
                 use_2cta_instrs=use_2cta_instrs,
                 deterministic=deterministic,
                 is_split_d=is_split_d_bwd,
+                is_split_dv=is_split_dv_bwd,
             )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
@@ -1043,8 +1164,8 @@ def _flash_attn_bwd(
             lse_log2_tensor,
             dpsum_tensor,
             dq_accum_tensor,
-            dk_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd) else dk_accum_tensor,
-            dv_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd) else dv_accum_tensor,
+            dk_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd and not is_split_dv_bwd) else dk_accum_tensor,
+            dv_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd and not is_split_dv_bwd) else dv_accum_tensor,
             softmax_scale,
             current_stream,
             cu_seqlens_q_tensor,
@@ -1064,8 +1185,8 @@ def _flash_attn_bwd(
         lse_log2_tensor,
         dpsum_tensor,
         dq_accum_tensor,
-        dk_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd) else dk_accum_tensor,
-        dv_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd) else dv_accum_tensor,
+        dk_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd and not is_split_dv_bwd) else dk_accum_tensor,
+        dv_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd and not is_split_dv_bwd) else dv_accum_tensor,
         softmax_scale,
         current_stream,
         cu_seqlens_q_tensor,
@@ -1139,6 +1260,41 @@ def _flash_attn_bwd(
                 half_hdim, n_block_size, AtomLayoutNdKV, dKV_swapAB,
                 False, 1, cu_seqlens_k_tensor, seqused_k_tensor, "dk_split",
             )
+
+        # dV split [low | high] postprocess
+        dv_accum_low, dv_accum_high = _slice_accum(dv_accum)
+        for accum_part, out_part in (
+            (dv_accum_low, dv[..., :half_hdim_v]),
+            (dv_accum_high, dv[..., half_hdim_v:]),
+        ):
+            _postprocess_run(
+                _to_cute(accum_part), _to_cute(out_part), cutlass.Float32(1.0),
+                half_hdim_v, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                False, 1, cu_seqlens_k_tensor, seqused_k_tensor, "dv_split",
+            )
+    elif is_split_dv_bwd:
+        half_hdim_v = head_dim_v // 2
+
+        def _slice_accum(t):
+            n = t.shape[-1] // 2
+            return t[..., :n], t[..., n:]
+
+        def _to_cute(t):
+            return from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(
+                leading_dim=t.ndim - 1
+            )
+
+        _postprocess_run(
+            dq_accum_tensor, dq_tensor, softmax_scale,
+            head_dim, m_block_size, AtomLayoutMdQ, dQ_swapAB,
+            use_2cta_instrs, 1, cu_seqlens_q_tensor, seqused_q_tensor, "dq",
+        )
+
+        _postprocess_run(
+            dk_accum_tensor, dk_tensor, softmax_scale,
+            head_dim, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+            False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "dk",
+        )
 
         # dV split [low | high] postprocess
         dv_accum_low, dv_accum_high = _slice_accum(dv_accum)
