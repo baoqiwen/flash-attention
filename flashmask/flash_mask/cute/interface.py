@@ -1278,8 +1278,8 @@ def _flash_attn_bwd(
     #
     # Only the shapes the merge is implemented for. 576/512 has no chunk width that
     # divides both axes, so the kernel pads the dv axis to 576 and lets the dO TMA
-    # zero-fill columns 512..575 (see tile_hdimv in flash_bwd_sm100_bigd.py); that keeps
-    # d_chunk at the measured 192 instead of narrowing it.
+    # zero-fill columns 512..575; that keeps d_chunk at the measured 192 instead
+    # of narrowing it.
     kv_shared = (
         is_bigd_bwd
         and (head_dim, head_dim_v) in ((512, 512), (576, 512))

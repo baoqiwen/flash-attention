@@ -446,24 +446,6 @@ class FlashAttentionForwardSm100:
             self.num_regs_correction = 64
             self.num_regs_other = 48
         elif self.is_split_d:
-            # Split-D runs 12 warps (384 threads), so the ptxas baseline is 65536/384 =
-            # 168 registers per thread and the whole-CTA budget is 3 * 168 = 504.
-            # setmaxnreg rules: warpgroup_reg_dealloc emits setmaxnreg.dec, so its target
-            # must be <= the baseline (asking for more traps with
-            # cudaErrorIllegalInstruction); only warpgroup_reg_alloc may exceed it.
-            # The register FILE is the real budget: 3 warpgroups * 128 threads * R must fit
-            # 65536 registers, i.e. sum(R) <= 512. 208 + 128 + 32 = 368 left ~140 registers
-            # per thread unclaimed while the kernel was spilling: ncu on d576/dv512 measured
-            # 938MB of local loads + 339MB of local stores, and 69.7% of the 20.8-cycle
-            # issue interval was an L1TEX scoreboard stall. So hand the slack out:
-            #   - softmax goes through warpgroup_reg_alloc, which may exceed the baseline;
-            #     256 is the setmaxnreg ceiling.
-            #   - `other` (mma + epilogue + generate_block) uses dealloc, so it must stay
-            #     <= the baseline; 64 keeps the margin that 168 (or even a pessimistic 128)
-            #     baseline requires while doubling what the dv=512 epilogue and the
-            #     flashmask block scan get.
-            #   - correction also uses dealloc; left at 128 so this run changes only the
-            #     two groups that can be raised without approaching the .dec limit.
             # 256 + 128 + 64 = 448 <= 512. Only the folded (dv > 256) config is retuned;
             # the symmetric d == dv == 256 split-D config keeps its measured 208/128/32.
             if self.folded_acc:
