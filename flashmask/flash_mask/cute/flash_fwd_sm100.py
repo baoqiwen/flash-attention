@@ -446,16 +446,16 @@ class FlashAttentionForwardSm100:
             self.num_regs_correction = 64
             self.num_regs_other = 48
         elif self.is_split_d:
-            # Split-D runs 12 warps (384 threads), so the ptxas baseline is 65536/384 =
-            # 168 registers per thread and the whole-CTA budget is 3 * 168 = 504.
-            # setmaxnreg rules: warpgroup_reg_dealloc emits setmaxnreg.dec, so its target
-            # must be <= the baseline (asking for more traps with
-            # cudaErrorIllegalInstruction); only warpgroup_reg_alloc may exceed it.
-            # 208 + 128 + 32 = 368 fits, and stays legal even if ptxas ends up handing out
-            # only 128 as the baseline.
-            self.num_regs_softmax = 208
-            self.num_regs_correction = 128
-            self.num_regs_other = 32
+            # 256 + 128 + 64 = 448 <= 512. Only the folded (dv > 256) config is retuned;
+            # the symmetric d == dv == 256 split-D config keeps its measured 208/128/32.
+            if self.folded_acc:
+                self.num_regs_softmax = 256
+                self.num_regs_correction = 128
+                self.num_regs_other = 64
+            else:
+                self.num_regs_softmax = 208
+                self.num_regs_correction = 128
+                self.num_regs_other = 32
 
         else:
             # self.num_regs_softmax = 192 if self.is_causal or self.is_local else 184
