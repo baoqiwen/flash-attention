@@ -525,8 +525,17 @@ class FlashAttentionBackwardSm100:
         if self.use_2cta_instrs:
             self.dQ_reduce_ncol_t2r = 32
             if self.tile_hdim == 192:
-                self.dQ_reduce_ncol = 24 if not self.is_causal else 32
-                self.sdQaccum_stage = 2 if not self.is_causal else 1
+                # 4-vec flashmask needs 2 extra Int32 columns of sStartEndRowIndices
+                # (tile_n * 8 B) and this config is already exactly at the SMEM cap, so
+                # give up the second dQaccum buffer. 32/1 keeps sdQaccum >= sdS_xchg,
+                # which overlays it (see the assert in _setup_smem_layout); 24/1 would
+                # be too small.
+                if not self.is_causal and not self.has_ut_start:
+                    self.dQ_reduce_ncol = 24
+                    self.sdQaccum_stage = 2
+                else:
+                    self.dQ_reduce_ncol = 32
+                    self.sdQaccum_stage = 1
             elif self.tile_hdim == 256:
                 # ncol only chooses how the reduce warps chunk ONE register fragment
                 # into bulk reduce-adds, so it does not change the flat gmem order of
@@ -544,7 +553,9 @@ class FlashAttentionBackwardSm100:
         else:
             self.dQ_reduce_ncol = 32
             self.dQ_reduce_ncol_t2r = self.dQ_reduce_ncol
-            self.sdQaccum_stage = 64 // self.dQ_reduce_ncol
+            # Same SMEM squeeze as the 2cta d=192 case above: the 1cta d<=128 config is
+            # exactly at the cap, so 4-vec flashmask drops to a single dQaccum buffer.
+            self.sdQaccum_stage = 1 if self.has_ut_start else 64 // self.dQ_reduce_ncol
 
         # ncu on d256/dv256 shows the kernel is register-spill bound (large local
         # ld/st traffic, most warp stalls on an L1TEX scoreboard, tensor pipe idle),
@@ -812,9 +823,11 @@ class FlashAttentionBackwardSm100:
             # self.dK_reduce_ncol same for dV
             self.sdV_layout = cute.make_layout((self.dKV_reduce_panel, 2))
 
-        # TODO(GuoxiaWang): 2 means only support flashmask startend_row_indices.shape[-1] <= 2
+        # 4 columns (LTS/LTE/UTS/UTE) only when startend_row_indices.shape[-1] == 4,
+        # otherwise 2 columns (LTS + either LTE or UTE) as before.
+        fm_num_vecs = 4 if const_expr(self.has_ut_start) else 2
         self.sStartEndRowIndices_layout = cute.make_layout(
-            shape=(self.tile_n, 2),
+            shape=(self.tile_n, fm_num_vecs),
             stride=(1, self.tile_n),
         )
 
@@ -930,6 +943,9 @@ class FlashAttentionBackwardSm100:
         self.ds_dtype = self.q_dtype
 
         self.enable_flashmask = cutlass.const_expr(flashmask_info is not None)
+        self.has_lt_end = const_expr(flashmask_info is not None and flashmask_info.LTE_nblock_max is not None)
+        self.has_ut_start = const_expr(flashmask_info is not None and flashmask_info.UTS_nblock_max is not None)
+        self.has_ut_end = const_expr(flashmask_info is not None and flashmask_info.UTE_nblock_max is not None)
 
         if const_expr(self.dKV_postprocess):
             assert self.dk_dtype.width == 32, "Must accumulate dK in float precision for GQA"
@@ -3020,7 +3036,8 @@ class FlashAttentionBackwardSm100:
                                     pipeline_Q.producer_commit(producer_state_Q_LSE)
                                     producer_state_Q_LSE.advance()
                                 # Subtract 1 to keep loop_start + 1 uniform.
-                                loop_start = sFM_max_min[7] - 1
+                                # Clamp against UTS_max, see the non-split walk.
+                                loop_start = max(sFM_max_min[4], sFM_max_min[7] - 1)
                             else:
                                 loop_start = sFM_max_min[7]
 
@@ -3434,7 +3451,8 @@ class FlashAttentionBackwardSm100:
                                     load_dO_low(m_block, producer_state=producer_state_dO_dPsum)
                                     pipeline_dO.producer_commit(producer_state_dO_dPsum)
                                     producer_state_dO_dPsum.advance()
-                                loop_start = sFM_max_min[7] - 1
+                                # Clamp against UTS_max, see the non-split walk.
+                                loop_start = max(sFM_max_min[4], sFM_max_min[7] - 1)
                             else:
                                 loop_start = sFM_max_min[7]
 
@@ -3706,7 +3724,10 @@ class FlashAttentionBackwardSm100:
                                 if tidx == 0 and self.debug_print:
                                     cute.printf('n_block: %d, after load_step 0 ~ UTS: %d', n_block, m_block)
                             # Subtract 1 beforehand to use loop_start + 1 uniformly in the for loop.
-                            loop_start = sFM_max_min[7] - 1
+                            # Clamp against UTS_max: with 4 vectors the two bands can overlap
+                            # (UTE_min <= UTS_max), and the blocks up to UTS_max were already
+                            # loaded above. mma and compute clamp the same way.
+                            loop_start = max(sFM_max_min[4], sFM_max_min[7] - 1)
                         else:
                             loop_start = sFM_max_min[7]
 
@@ -4023,22 +4044,38 @@ class FlashAttentionBackwardSm100:
 
         for i in cutlass.range_constexpr(ntimes_copy):
             copy_offset = i * num_load_threads + tidx
-            sStartEndRowIndices[copy_offset, 0] = 2147483647
-            sStartEndRowIndices[copy_offset, 1] = 2147483647
+            if const_expr(self.has_ut_start):
+                # 4-vec: the mask is the union of [slot0, slot1) and [slot2, slot3).
+                # For an out-of-range key column the lower band must cover every row so
+                # that the column ends up fully masked, and the upper band must be empty.
+                sStartEndRowIndices[copy_offset, 0] = 0
+                sStartEndRowIndices[copy_offset, 1] = 2147483647
+                sStartEndRowIndices[copy_offset, 2] = 0
+                sStartEndRowIndices[copy_offset, 3] = 0
+            else:
+                sStartEndRowIndices[copy_offset, 0] = 2147483647
+                sStartEndRowIndices[copy_offset, 1] = 2147483647
             local_k_row = n_block * self.tile_n + copy_offset
             if (copy_offset < self.tile_n and local_k_row < seqlen_info.seqlen_k):
                 global_k_row = segment_row_offset + local_k_row
                 LTS = flashmask_info.startend_row_indices[fm_batch_idx, fm_head_idx, None, 0]
                 sStartEndRowIndices[copy_offset, 0] = LTS[global_k_row]
-                #assert const_expr(num_vec <= 2), "only support num_vec == 2 now"
-                if const_expr(flashmask_info.LTE_nblock_max is not None):
+                if const_expr(self.has_ut_start):
+                    # non-causal 4-vec: [LTS, LTE) and [UTS, UTE) from source cols 0..3
+                    LTE = flashmask_info.startend_row_indices[fm_batch_idx, fm_head_idx, None, 1]
+                    UTS = flashmask_info.startend_row_indices[fm_batch_idx, fm_head_idx, None, 2]
+                    UTE = flashmask_info.startend_row_indices[fm_batch_idx, fm_head_idx, None, 3]
+                    sStartEndRowIndices[copy_offset, 1] = LTE[global_k_row]
+                    sStartEndRowIndices[copy_offset, 2] = UTS[global_k_row]
+                    sStartEndRowIndices[copy_offset, 3] = UTE[global_k_row]
+                elif const_expr(self.has_lt_end):
+                    # causal 2-vec: [LTS, LTE)
                     LTE = flashmask_info.startend_row_indices[fm_batch_idx, fm_head_idx, None, 1]
                     sStartEndRowIndices[copy_offset, 1] = LTE[global_k_row]
-                if const_expr(flashmask_info.UTE_nblock_max is not None):
+                elif const_expr(self.has_ut_end):
+                    # non-causal 2-vec: source col 1 is UTE, the mask is [0, UTE) | [LTS, inf)
                     UTE = flashmask_info.startend_row_indices[fm_batch_idx, fm_head_idx, None, 1]
                     sStartEndRowIndices[copy_offset, 1] = UTE[global_k_row]
-                #cute.printf("%d, %d", copy_offset, sStartEndRowIndices[copy_offset, 0])
-                #cute.print_tensor(LTS)
         cute.arch.sync_warp()
 
     @cute.jit
@@ -5292,6 +5329,7 @@ class FlashAttentionBackwardSm100:
                 mask_local=self.is_local,
                 sStartEndRowIndices=sStartEndRowIndices,
                 per_cta_tile_n=self.tile_n,
+                has_ut_start=self.has_ut_start,
             )
 
             # prefetch_LSE = not self.is_causal
@@ -5425,6 +5463,11 @@ class FlashAttentionBackwardSm100:
                                     )
                                     if tidx == 0 and self.debug_print:
                                         cute.printf('n_block: %d, after compute_step UTS_min ~ UTS_max: %d', n_block, m_block)
+                                # Advance past UTS_max: with 4 vectors the upper band's
+                                # [UTE_min, UTE_max] range can overlap [UTS_min, UTS_max],
+                                # and those blocks are already done. Same clamp as in the
+                                # mma block count and the load walk.
+                                loop_start = loop_end
 
                             loop_start = max(loop_start, sFM_max_min[7]) # UTE_min
                             loop_end = min(sFM_max_min[6] + 1, m_block_max) # UTE_max

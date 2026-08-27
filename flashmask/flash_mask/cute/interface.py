@@ -129,19 +129,12 @@ def _is_valid_flash_dims(query, key, value, fa_version=2):
     return False
 
 
-def _is_non_4vec_startend(startend_row_indices):
-    return startend_row_indices is None or startend_row_indices.shape[-1] != 4
-
-
-def _is_cutedsl_kernel_supported(query, key, value, startend_row_indices=None):
+def _is_cutedsl_kernel_supported(query, key, value):
     fa_version = _get_fa_version()
     if not _is_valid_flash_dims(query, key, value, fa_version):
         return False
-    if fa_version == 3:                       # SM90
-        return True
-    if fa_version == 4:                       # SM100
-        return _is_non_4vec_startend(startend_row_indices)
-    return False
+    # SM90 (fa3) and SM100 (fa4)
+    return fa_version in (3, 4)
 
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
@@ -3179,7 +3172,7 @@ def flashmask_attention(
     learnable_sink: paddle.Tensor | None = None,
     group=None,
 ):
-    if _is_cutedsl_kernel_supported(query, key, value, startend_row_indices):
+    if _is_cutedsl_kernel_supported(query, key, value):
         assert dropout == 0.0, (
             "flashmask v4 does not support dropout"
         )
