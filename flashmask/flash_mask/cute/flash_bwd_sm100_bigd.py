@@ -64,7 +64,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from flash_mask.cute import blackwell_helpers as sm100_utils
 from flash_mask.cute.blackwell_helpers import SM100_SMEM_CAPACITY_BYTES
-from flash_mask.cute import copy_utils, layout_utils, utils
+from flash_mask.cute import barrier, copy_utils, layout_utils, utils
 from flash_mask.cute.tile_scheduler import SingleTileScheduler, TileSchedulerArguments
 
 
@@ -724,10 +724,11 @@ class FlashAttentionBackwardSm100BigD:
         )
         self.fm_bound_num = fm_bound_num
 
-        assert not deterministic, (
-            "deterministic reduction is not supported by the big-headdim bwd: dK / dV / "
-            "dQ are accumulated with red.global.add, whose order is not reproducible"
-        )
+        # Deterministic (bitwise reproducible) reduction. dQ / dK / dV are cross-CTA
+        # fp32 gmem reduces, so the arrival order decides the result. Under this flag a
+        # global int32 semaphore pins that order: a CTA spins until the counter equals
+        # its own ordinal, reduces, then increments. See the drain warp below.
+        self.deterministic = deterministic
         # cta_group=2 is NOT ENABLED and has never run: _launch builds multicast TMA
         # atoms from cluster_shape_mnk but passes no `cluster=` to .launch(), and the grid
         # is not rounded to a multiple of the pair size. The column rules in tmem_plan(),
@@ -1041,10 +1042,13 @@ class FlashAttentionBackwardSm100BigD:
         # softmax by the time the output gemms run. Each warpgroup gets its OWN
         # staging slot (drain: 0, compute: 1) and its own named barrier (4 / 5), so
         # the two bulk-reduce streams share no state.
+        # `deterministic` forces this off: the dQ semaphore has a single releaser per
+        # CTA, so exactly one warpgroup must own the whole dQ drain.
         self.drain_split = (
             self.kv_shared
             and self.out_stage >= 2
             and (self.d_chunk // self.dQ_reduce_ncol) % 2 == 0
+            and not self.deterministic
         )
 
         # SMEM operand reuse. K carries across m iterations, Q / dO do not. V has a
@@ -1360,9 +1364,19 @@ class FlashAttentionBackwardSm100BigD:
             assert flashmask_info.is_causal == self.is_causal, (
                 "flashmask_info.is_causal disagrees with the kernel's is_causal"
             )
-        assert mdQ_semaphore is None and mdK_semaphore is None and mdV_semaphore is None, (
-            "deterministic reduction is not supported by the big-headdim bwd yet"
-        )
+        if cutlass.const_expr(self.deterministic):
+            assert mdQ_semaphore is not None, (
+                "deterministic needs a dQ semaphore"
+            )
+            assert self.qhead_per_kvhead == 1 or mdK_semaphore is not None, (
+                "deterministic with qhead_per_kvhead > 1 needs a dK semaphore"
+            )
+            # mdV_semaphore is accepted but unused: the single dK lock is held across the
+            # whole m loop, which already serialises this CTA's dV reduces too.
+        else:
+            assert mdQ_semaphore is None and mdK_semaphore is None and mdV_semaphore is None, (
+                "semaphores were passed but the kernel was not built with deterministic=True"
+            )
         assert overlap_k_addr is None and overlap_dk_addr is None, (
             "the FM-4 overlap path is not supported by the big-headdim bwd"
         )
@@ -1385,6 +1399,9 @@ class FlashAttentionBackwardSm100BigD:
                 if cutlass.const_expr(flashmask_info is None)
                 else flashmask_info.startend_row_indices
             ),
+            mdQ_semaphore=mdQ_semaphore,
+            mdK_semaphore=mdK_semaphore,
+            mdV_semaphore=mdV_semaphore,
         )
 
     def _launch(
@@ -1401,6 +1418,9 @@ class FlashAttentionBackwardSm100BigD:
         softmax_scale_log2: Float32,
         stream,
         mFM: Optional[cute.Tensor] = None,
+        mdQ_semaphore: Optional[cute.Tensor] = None,
+        mdK_semaphore: Optional[cute.Tensor] = None,
+        mdV_semaphore: Optional[cute.Tensor] = None,
     ):
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
@@ -1505,6 +1525,9 @@ class FlashAttentionBackwardSm100BigD:
             mdQaccum,
             mdKaccum,
             mdVaccum,
+            mdQ_semaphore,
+            mdK_semaphore,
+            mdV_semaphore,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -1546,6 +1569,9 @@ class FlashAttentionBackwardSm100BigD:
         mdQaccum: cute.Tensor,
         mdKaccum: cute.Tensor,
         mdVaccum: cute.Tensor,
+        mdQ_semaphore: Optional[cute.Tensor],
+        mdK_semaphore: Optional[cute.Tensor],
+        mdV_semaphore: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
@@ -1866,7 +1892,15 @@ class FlashAttentionBackwardSm100BigD:
             fm_heads = cute.size(mFM.shape[1])
             fm_b = batch_idx if cute.size(mFM.shape[0]) > 1 else Int32(0)
             fm_h = head_idx // (cute.size(mQ.shape[2]) // fm_heads)
-        if cutlass.const_expr(self.fm_bound_num in (1, 2)):
+        if cutlass.const_expr(self.fm_bound_num in (1, 2) and not self.deterministic):
+            # `deterministic` excludes itself from this narrowing on purpose. The dQ
+            # semaphore uses `lock_value = n_block`, which is only a valid arrival count
+            # if the set of CTAs that write a given m block is a PREFIX {0..N} of the n
+            # axis. The causal m_lo above is monotone in n_block, so it keeps that
+            # property; the flashmask-derived m_lo / m_hi / band below are not, and a hole
+            # in the sequence hangs the counter forever. Giving up the skip only costs
+            # time -- the per-element mask still zeroes the masked-out elements.
+            #
             # fm_bound_num == 4 (non-causal, both tails bounded) deliberately gets NO
             # skip: it would need four reduced scalars (max/min of both tails' starts and
             # ends) and the resulting iteration space is two bands rather than one, which
@@ -3105,6 +3139,29 @@ class FlashAttentionBackwardSm100BigD:
                 )
                 cute.arch.mbarrier_arrive(mbar_tmem_dealloc)
             else:
+                # Deterministic dK / dV: with qhead_per_kvhead > 1 several query-head CTAs
+                # add into the same dK / dV rows. Serialise them in a fixed
+                # (head_idx % qhead_per_kvhead) order by holding one lock across the WHOLE
+                # m loop -- a per-m-block lock would have head 0 wait on head Q-1, i.e. on
+                # a HIGHER linear blockIdx, which deadlocks at less than full occupancy.
+                # One lock covers dV as well: under kv_shared dV is drained together with
+                # dK, and otherwise both drains sit inside this same critical section.
+                need_dKV_lock = cutlass.const_expr(
+                    self.deterministic and self.qhead_per_kvhead > 1
+                )
+                if cutlass.const_expr(need_dKV_lock):
+                    dKV_lock = mdK_semaphore[batch_idx, head_idx_kv, n_block, None].iterator
+                    barrier.wait_eq(
+                        dKV_lock,
+                        drain_tidx,
+                        0,
+                        Int32(head_idx % self.qhead_per_kvhead),
+                    )
+                    cute.arch.barrier(
+                        barrier_id=drain_barrier_id, number_of_threads=num_drain_threads
+                    )
+                if cutlass.const_expr(self.deterministic):
+                    mdQ_sem_cur = mdQ_semaphore[batch_idx, head_idx, None, None]
                 for it in cutlass.range(num_iters, unroll=1):
                     # Same iteration mapping as the mma / compute warps: the counter
                     # drives the barrier phases, m_iter is the actual block index (it
@@ -3146,6 +3203,24 @@ class FlashAttentionBackwardSm100BigD:
                     for oi in cutlass.range_constexpr(len(outputs)):
                         (nchunks, chunk_w, maccum, hd_slice, num_blocks,
                          block_idx, base, in_bar, in_bar2) = outputs[oi]
+                        # dQ is always the LAST entry, and it is the only output whose
+                        # accumulator row block (m_iter) is shared with other CTAs of this
+                        # grid's x dimension. Deterministic pins the order of those adds:
+                        # spin until the counter for this m block equals our own n_block,
+                        # reduce, then hand it to n_block + 1.
+                        #
+                        # `lock_value = n_block` is only an arrival count because the CTAs
+                        # that touch a given m block form a PREFIX {0..N} of the n axis --
+                        # which is why the flashmask narrowing is disabled under this flag
+                        # (see the m skip range above).
+                        is_dQ = cutlass.const_expr(oi == len(outputs) - 1)
+                        if cutlass.const_expr(self.deterministic and is_dQ):
+                            dQ_lock = mdQ_sem_cur[(m_iter, None)].iterator
+                            barrier.wait_eq(dQ_lock, drain_tidx, 0, Int32(n_block))
+                            cute.arch.barrier(
+                                barrier_id=drain_barrier_id,
+                                number_of_threads=num_drain_threads,
+                            )
 
                         chunks_per_slice = cutlass.const_expr(hd_slice // chunk_w)
                         # Offsets are plain pointer arithmetic instead of nested local_tile
@@ -3252,7 +3327,20 @@ class FlashAttentionBackwardSm100BigD:
                                     )
                                     % max(self.out_stage, 1)
                                 )
-                                if cutlass.const_expr(self.kv_shared):
+                                if cutlass.const_expr(
+                                    self.kv_shared and not self.deterministic
+                                ):
+                                    # `deterministic` takes the register-atomic branch
+                                    # below instead: the bulk reduce is an async-proxy
+                                    # operation, so two reduces to the SAME accumulator
+                                    # address from different m iterations are unordered
+                                    # unless every one of them is drained with
+                                    # cp_async_bulk_wait_group(0, read=False) first. The
+                                    # register path needs no such drain -- each address is
+                                    # written by exactly one thread (gbase carries
+                                    # drain_tidx * 4), so same-thread same-address
+                                    # coherence already orders it.
+                                    #
                                     # Stage the slice in SMEM and let ONE bulk reduce-add
                                     # move all 32KB of it, instead of 128 threads x 16
                                     # red.global.add.v4.f32. Same bytes, but the drain warps
@@ -3317,9 +3405,30 @@ class FlashAttentionBackwardSm100BigD:
                                             gbase + r * (num_drain_threads * 4),
                                         )
 
+                        if cutlass.const_expr(self.deterministic and is_dQ):
+                            # Every drain thread issued its own atomics, but only thread 0
+                            # publishes the release. red.release orders the RELEASING
+                            # thread's writes, so the other 127 have to fence their own and
+                            # then rendezvous before the counter moves.
+                            barrier.fence_acq_rel_gpu()
+                            cute.arch.barrier(
+                                barrier_id=drain_barrier_id,
+                                number_of_threads=num_drain_threads,
+                            )
+                            barrier.arrive_inc(dQ_lock, drain_tidx, 0, 1)
+
                     phase ^= 1
 
-                if cutlass.const_expr(self.kv_shared):
+                if cutlass.const_expr(need_dKV_lock):
+                    # dK / dV for this key block are complete; hand the kv head to the next
+                    # query head in the group.
+                    barrier.fence_acq_rel_gpu()
+                    cute.arch.barrier(
+                        barrier_id=drain_barrier_id, number_of_threads=num_drain_threads
+                    )
+                    barrier.arrive_inc(dKV_lock, drain_tidx, 0, 1)
+
+                if cutlass.const_expr(self.kv_shared and not self.deterministic):
                     # The staged path leaves bulk groups in flight, and their SMEM source is
                     # this CTA's staging buffer, so they have to have READ it before the CTA
                     # exits and the buffer is handed to the next one.

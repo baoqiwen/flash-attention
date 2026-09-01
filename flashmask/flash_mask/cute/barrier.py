@@ -45,6 +45,26 @@ def wait_write_ptr_ge(wptr: cute.Pointer, elem_idx: int | Int32, target: Int32) 
 
 
 @dsl_user_op
+def fence_acq_rel_gpu(*, loc=None, ip=None) -> None:
+    """Device-scope acquire-release fence, i.e. CUDA C's ``__threadfence()``.
+
+    Needed when a group of threads issues global reduces but a *different*
+    (single elected) thread publishes the release: ``red.release`` only orders the
+    releasing thread's own prior writes, so every other thread has to fence its
+    own writes before the group rendezvous.
+    """
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.acq_rel.gpu;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def red_relaxed(
     lock_ptr: cute.Pointer, val: cutlass.Constexpr[Int32], *, loc=None, ip=None
 ) -> None:

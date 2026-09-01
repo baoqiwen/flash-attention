@@ -1291,7 +1291,6 @@ def _flash_attn_bwd(
 
     bigd_cfg = None
     if is_bigd_bwd:
-        assert not deterministic, "deterministic reduction is not supported by big-headdim bwd"
         assert group is None or group.world_size <= 1, (
             "overlap is not supported by big-headdim bwd"
         )
