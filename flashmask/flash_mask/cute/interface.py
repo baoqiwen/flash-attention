@@ -104,6 +104,8 @@ paddle2cute_dtype_map = {
     paddle.float32: cutlass.Float32,
 }
 
+_LEARNABLE_SINK_DTYPES = (paddle.float16, paddle.bfloat16, paddle.float32)
+
 
 def _get_fa_version():
     return paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"]
@@ -611,7 +613,9 @@ def _flash_attn_fwd(
         assert learnable_sink.shape == [
             num_head,
         ]
-        assert learnable_sink.dtype == paddle.bfloat16, "learnable_sink must be bfloat16"
+        assert learnable_sink.dtype in _LEARNABLE_SINK_DTYPES, (
+            "learnable_sink must be float16, bfloat16 or float32"
+        )
 
     assert all(
         t is None or t.place.is_gpu_place()
@@ -1022,6 +1026,7 @@ def _flash_attn_fwd(
         window_size_left is not None,
         window_size_right is not None,
         learnable_sink is not None,
+        paddle2cute_dtype_map[learnable_sink.dtype] if learnable_sink is not None else None,
         m_block_size,
         n_block_size,
         num_threads,
@@ -1279,7 +1284,12 @@ def _flash_attn_bwd(
         and k.dtype == v.dtype
         and list(k.shape[:-1]) == list(v.shape[:-1])
         and v.shape[-1] <= k.shape[-1]
-        and tuple(k.strides[:-1]) == tuple(v.strides[:-1])
+        # Full strides, not strides[:-1]: v is expected to be the leading-column view
+        # k[..., :dv], which keeps k's strides including the last one. Comparing only
+        # the leading strides would also accept e.g. k[..., ::2], and maybe_contiguous()
+        # below (called ~180 lines later) would then replace v with a private copy while
+        # the kernel still folds dV into the dK accumulator and returns an all-zero dv.
+        and tuple(k.strides) == tuple(v.strides)
         # Last on purpose: this is the only term that can raise (see _same_storage), so
         # `and` short-circuits every call that is not otherwise a kv-shared call before
         # the pointer comparison is attempted.
