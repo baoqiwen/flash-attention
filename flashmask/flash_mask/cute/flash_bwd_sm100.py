@@ -4191,6 +4191,13 @@ class FlashAttentionBackwardSm100:
         [UTS_max + 1, UTE_min), which are disjoint from all three ranges above. That
         matters because fm_skip_info deliberately keeps one fully masked block alive
         when a KV tile is masked everywhere, and relies on the mask to zero it.
+
+        With 4 vectors each test looks at ONE band only: below UTS_min it ignores the
+        lower band, above LTE_max it ignores the upper one. That is sound because the
+        two bands are per-column triangle-ordered (UTS <= UTE <= col < LTS <= LTE),
+        which is what "upper / lower tail" means in flashmask -- a mask whose upper
+        band reached below some other column's LTS would need the union predicate the
+        host side uses for the fwd (fm_partial in flashmask_utils.prepare_block_maxmin).
         """
         needs_mask = cutlass.Boolean(True)
         if const_expr(not self.is_causal):
@@ -6655,7 +6662,14 @@ class FlashAttentionBackwardSm100:
                     cute.arch.mbarrier_arrive(dQaccum_empty_mbar_ptr)
 
             # semaphore release
-            # NOTE: arrive_inc calls red_release which issues membar
+            # NOTE: barrier.red_release emits a bare red.release.gpu, which orders only
+            # the releasing thread's own prior writes -- it is NOT a membar. What makes
+            # this release safe is that dQaccum is written by a single elected thread's
+            # cpasync_reduce_bulk_add_f32 and the wait_group above runs with
+            # read_flag = not deterministic, i.e. read=False, so the reduce has completed
+            # before the counter moves. The big-headdim kernel drains dQaccum with
+            # per-thread red.global.add instead, so it needs an explicit
+            # cute.arch.fence_acq_rel_gpu() before its rendezvous.
             if const_expr(self.deterministic and not delay_semaphore_release):
                 if const_expr(self.sdQaccum_stage > 1 and not self.use_2cta_bigd):
                     if is_tma_warp:

@@ -1024,7 +1024,9 @@ class FlashAttentionBackwardSm100BigD:
         # What does help is dividing a term by something other than a tile size:
         # packing H q heads into one CTA divides the dKV term by H (they share one
         # dK / dV accumulator when num_head_kv == 1).
-        self.out_stage = 2 if self.kv_shared else 0
+        # deterministic never enters the staged drain (see the register-atomic branch in
+        # the drain warp), so the staging slots would be reserved and never touched.
+        self.out_stage = 2 if (self.kv_shared and not self.deterministic) else 0
         self.out_stage_elems = self.tile_m * self.dQ_reduce_ncol
         # Two-warpgroup drain split (kv_shared only). With ONE TMEM out slot (the
         # 576/512 config) the chunk chain "output gemm -> T2R -> next gemm" is
@@ -1263,7 +1265,9 @@ class FlashAttentionBackwardSm100BigD:
         # (the two are fused, see the mma warp) and V needs neither storage nor a TMA.
         # The buffer is not wasted: it becomes the drain's bulk reduce-add staging, so
         # the field is sized for whichever of the two the mode needs (they are never
-        # both live) and typed as bytes like sQ.
+        # both live) and typed as bytes like sQ. Under kv_shared + deterministic neither
+        # is needed -- the drain uses per-thread atomics, so out_stage is 0 -- and the
+        # field collapses to zero bytes.
         sV_bytes = cute.size_in_bytes(q_dtype, self.sV_layout)
         sV_alloc_bytes = max(
             0 if self.kv_shared else sV_bytes,
@@ -1799,10 +1803,11 @@ class FlashAttentionBackwardSm100BigD:
         # exist to size the allocation.
         sLSE = storage.sLSE.get_tensor(cute.make_layout(self.tile_m))
         sdPsum = storage.sdPsum.get_tensor(cute.make_layout(self.tile_m))
-        if cutlass.const_expr(self.kv_shared):
+        if cutlass.const_expr(self.kv_shared and not self.deterministic):
             # (elements of one slice, slot), living in sV's storage -- sV is dead under
             # kv_shared. Flat on purpose: the bulk reduce-add moves the slot verbatim,
-            # so the SMEM order IS the accumulator's gmem order.
+            # so the SMEM order IS the accumulator's gmem order. deterministic drains
+            # with per-thread atomics instead, so it gets no staging (out_stage == 0).
             sOutAccum = storage.sV.get_tensor(
                 cute.make_layout((self.out_stage_elems, self.out_stage)),
                 dtype=Float32,
@@ -1900,6 +1905,15 @@ class FlashAttentionBackwardSm100BigD:
             # property; the flashmask-derived m_lo / m_hi / band below are not, and a hole
             # in the sequence hangs the counter forever. Giving up the skip only costs
             # time -- the per-element mask still zeroes the masked-out elements.
+            #
+            # TODO: the skip and the counter are not actually exclusive. The small-headdim
+            # sm100 kernel keeps both (see flash_bwd_sm100.py's dQ reduce loop, "Walk every
+            # block but reduce only the ones the mma warp produced"): its drain loop walks
+            # EVERY m block as a predicate and still runs the semaphore handshake for the
+            # blocks it skips, so the arrival counts stay dense. flash_bwd_sm90.py does the
+            # same catch-up for local masking. Porting that here would restore the skip for
+            # deterministic; it means turning this drain's segment walk into a
+            # walk-all-plus-predicate loop, so it is left as a follow-up.
             #
             # fm_bound_num == 4 (non-causal, both tails bounded) deliberately gets NO
             # skip: it would need four reduced scalars (max/min of both tails' starts and
@@ -3146,6 +3160,15 @@ class FlashAttentionBackwardSm100BigD:
                 # a HIGHER linear blockIdx, which deadlocks at less than full occupancy.
                 # One lock covers dV as well: under kv_shared dV is drained together with
                 # dK, and otherwise both drains sit inside this same critical section.
+                #
+                # Cost: the lock spans the whole m loop, so the qhead_per_kvhead CTAs of a
+                # kv head group run their m loops strictly one after another, not just
+                # their dK / dV writebacks -- throughput for deterministic GQA drops by
+                # roughly that factor. flash_bwd_sm90.py can scope its two locks to the
+                # epilogue only because it reduces dK / dV once, at the end; here every m
+                # iteration reduces into the same dK / dV rows, so a narrower critical
+                # section would need a per-m-block counter walked in the same direction as
+                # dQ's (waiting on a LOWER linear blockIdx) instead of the head ordinal.
                 need_dKV_lock = cutlass.const_expr(
                     self.deterministic and self.qhead_per_kvhead > 1
                 )
@@ -3407,10 +3430,13 @@ class FlashAttentionBackwardSm100BigD:
 
                         if cutlass.const_expr(self.deterministic and is_dQ):
                             # Every drain thread issued its own atomics, but only thread 0
-                            # publishes the release. red.release orders the RELEASING
-                            # thread's writes, so the other 127 have to fence their own and
-                            # then rendezvous before the counter moves.
-                            barrier.fence_acq_rel_gpu()
+                            # publishes the release. red.release only orders the RELEASING
+                            # thread's own prior writes, so the other 127 have to fence
+                            # their own at device scope and then rendezvous before the
+                            # counter moves. fence.acq_rel.gpu is CUDA C's
+                            # __threadfence(); the named barrier after it is CTA scope
+                            # only, which is why the fence cannot be dropped.
+                            cute.arch.fence_acq_rel_gpu()
                             cute.arch.barrier(
                                 barrier_id=drain_barrier_id,
                                 number_of_threads=num_drain_threads,
@@ -3421,8 +3447,10 @@ class FlashAttentionBackwardSm100BigD:
 
                 if cutlass.const_expr(need_dKV_lock):
                     # dK / dV for this key block are complete; hand the kv head to the next
-                    # query head in the group.
-                    barrier.fence_acq_rel_gpu()
+                    # query head in the group. Same release pattern as the dQ hand-off:
+                    # device-scope fence per thread, then the rendezvous, then one thread
+                    # bumps the counter.
+                    cute.arch.fence_acq_rel_gpu()
                     cute.arch.barrier(
                         barrier_id=drain_barrier_id, number_of_threads=num_drain_threads
                     )

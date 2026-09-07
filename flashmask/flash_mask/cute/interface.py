@@ -1284,15 +1284,7 @@ def _flash_attn_bwd(
         and k.dtype == v.dtype
         and list(k.shape[:-1]) == list(v.shape[:-1])
         and v.shape[-1] <= k.shape[-1]
-        # Full strides, not strides[:-1]: v is expected to be the leading-column view
-        # k[..., :dv], which keeps k's strides including the last one. Comparing only
-        # the leading strides would also accept e.g. k[..., ::2], and maybe_contiguous()
-        # below (called ~180 lines later) would then replace v with a private copy while
-        # the kernel still folds dV into the dK accumulator and returns an all-zero dv.
         and tuple(k.strides) == tuple(v.strides)
-        # Last on purpose: this is the only term that can raise (see _same_storage), so
-        # `and` short-circuits every call that is not otherwise a kv-shared call before
-        # the pointer comparison is attempted.
         and _same_storage(k, v)
     )
 
