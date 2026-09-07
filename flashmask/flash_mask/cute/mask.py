@@ -613,6 +613,9 @@ class AttentionMask:
         # value as constexpr.
         partially_masked,
         per_cta_tile_n: cutlass.Constexpr[int] = 0,
+        # True when startend_row_indices.shape[-1] == 4, i.e. sStartEndRowIndices holds
+        # 4 columns [LTS, LTE, UTS, UTE] instead of 2.
+        has_ut_start: cutlass.Constexpr[bool] = False,
     ) -> None:
         """
         Backward pass: mask S = K @ Q.T where n_block tiles seqlen_k and m_block tiles seqlen_q.
@@ -636,16 +639,33 @@ class AttentionMask:
                 # but sStartEndRowIndices has per-CTA tile_n entries (e.g. 128).
                 # Convert global COL to per-CTA local coordinate.
                 _fm_tile_n = per_cta_tile_n if const_expr(per_cta_tile_n > 0) else self.tile_n
-                for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
-                    col_local = tScS_t2r[i][COL] % _fm_tile_n
-                    lts = sStartEndRowIndices[col_local, 0] - m_block * self.tile_m
-                    ute = sStartEndRowIndices[col_local, 1] - m_block * self.tile_m
-                    acc_S[i] = (
-                        -cutlass.Float32.inf if tScS_t2r[i][ROW] >= lts else acc_S[i]
-                    )
-                    acc_S[i] = (
-                        -cutlass.Float32.inf if tScS_t2r[i][ROW] < ute else acc_S[i]
-                    )
+                if const_expr(has_ut_start):
+                    # 4 vectors: mask out the union of the lower band [LTS, LTE) and
+                    # the upper band [UTS, UTE). Same semantics as apply_flashmask_sm90.
+                    for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                        col_local = tScS_t2r[i][COL] % _fm_tile_n
+                        m_offset = m_block * self.tile_m
+                        lts = sStartEndRowIndices[col_local, 0] - m_offset
+                        lte = sStartEndRowIndices[col_local, 1] - m_offset
+                        uts = sStartEndRowIndices[col_local, 2] - m_offset
+                        ute = sStartEndRowIndices[col_local, 3] - m_offset
+                        row = tScS_t2r[i][ROW]
+                        acc_S[i] = (
+                            -cutlass.Float32.inf
+                            if (row >= lts and row < lte) or (row >= uts and row < ute)
+                            else acc_S[i]
+                        )
+                else:
+                    for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                        col_local = tScS_t2r[i][COL] % _fm_tile_n
+                        lts = sStartEndRowIndices[col_local, 0] - m_block * self.tile_m
+                        ute = sStartEndRowIndices[col_local, 1] - m_block * self.tile_m
+                        acc_S[i] = (
+                            -cutlass.Float32.inf if tScS_t2r[i][ROW] >= lts else acc_S[i]
+                        )
+                        acc_S[i] = (
+                            -cutlass.Float32.inf if tScS_t2r[i][ROW] < ute else acc_S[i]
+                        )
 
         else:  # Causal or local
             thr_row_offset = tScS_t2r[0][ROW]

@@ -104,6 +104,8 @@ paddle2cute_dtype_map = {
     paddle.float32: cutlass.Float32,
 }
 
+_LEARNABLE_SINK_DTYPES = (paddle.float16, paddle.bfloat16, paddle.float32)
+
 
 def _get_fa_version():
     return paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"]
@@ -129,19 +131,12 @@ def _is_valid_flash_dims(query, key, value, fa_version=2):
     return False
 
 
-def _is_non_4vec_startend(startend_row_indices):
-    return startend_row_indices is None or startend_row_indices.shape[-1] != 4
-
-
-def _is_cutedsl_kernel_supported(query, key, value, startend_row_indices=None):
+def _is_cutedsl_kernel_supported(query, key, value):
     fa_version = _get_fa_version()
     if not _is_valid_flash_dims(query, key, value, fa_version):
         return False
-    if fa_version == 3:                       # SM90
-        return True
-    if fa_version == 4:                       # SM100
-        return _is_non_4vec_startend(startend_row_indices)
-    return False
+    # SM90 (fa3) and SM100 (fa4)
+    return fa_version in (3, 4)
 
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
@@ -618,7 +613,9 @@ def _flash_attn_fwd(
         assert learnable_sink.shape == [
             num_head,
         ]
-        assert learnable_sink.dtype == paddle.bfloat16, "learnable_sink must be bfloat16"
+        assert learnable_sink.dtype in _LEARNABLE_SINK_DTYPES, (
+            "learnable_sink must be float16, bfloat16 or float32"
+        )
 
     assert all(
         t is None or t.place.is_gpu_place()
@@ -1029,6 +1026,7 @@ def _flash_attn_fwd(
         window_size_left is not None,
         window_size_right is not None,
         learnable_sink is not None,
+        paddle2cute_dtype_map[learnable_sink.dtype] if learnable_sink is not None else None,
         m_block_size,
         n_block_size,
         num_threads,
@@ -1286,10 +1284,7 @@ def _flash_attn_bwd(
         and k.dtype == v.dtype
         and list(k.shape[:-1]) == list(v.shape[:-1])
         and v.shape[-1] <= k.shape[-1]
-        and tuple(k.strides[:-1]) == tuple(v.strides[:-1])
-        # Last on purpose: this is the only term that can raise (see _same_storage), so
-        # `and` short-circuits every call that is not otherwise a kv-shared call before
-        # the pointer comparison is attempted.
+        and tuple(k.strides) == tuple(v.strides)
         and _same_storage(k, v)
     )
 
@@ -1298,7 +1293,6 @@ def _flash_attn_bwd(
 
     bigd_cfg = None
     if is_bigd_bwd:
-        assert not deterministic, "deterministic reduction is not supported by big-headdim bwd"
         assert group is None or group.world_size <= 1, (
             "overlap is not supported by big-headdim bwd"
         )
@@ -3179,7 +3173,7 @@ def flashmask_attention(
     learnable_sink: paddle.Tensor | None = None,
     group=None,
 ):
-    if _is_cutedsl_kernel_supported(query, key, value, startend_row_indices):
+    if _is_cutedsl_kernel_supported(query, key, value):
         assert dropout == 0.0, (
             "flashmask v4 does not support dropout"
         )

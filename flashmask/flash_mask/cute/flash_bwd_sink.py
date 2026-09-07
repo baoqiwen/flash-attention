@@ -62,8 +62,10 @@ class FlashAttentionBackwardDsink:
             raise TypeError("lse_log2 tensor must be Float32")
         if cutlass.const_expr(mDsink.element_type not in [Float32]):
             raise TypeError("dsink output tensor must be Float32")
-        if cutlass.const_expr(mSink.element_type not in [cutlass.BFloat16]):
-            raise TypeError("sink tensor must be BFloat16")
+        if cutlass.const_expr(
+            mSink.element_type not in [cutlass.Float16, cutlass.BFloat16, Float32]
+        ):
+            raise TypeError("sink tensor must be Float16, BFloat16 or Float32")
 
         num_head = mDpsum.shape[1]
 
