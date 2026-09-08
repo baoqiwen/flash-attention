@@ -3122,6 +3122,17 @@ class FlashMaskFunc(paddle.autograd.PyLayer):
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.group = group
+        # Paddle requires backward to return None at exactly the positions whose
+        # forward input had stop_gradient=True, so record
+        # which of the differentiable inputs actually want a gradient. Read it
+        # here rather than in backward: saved_tensor() does not carry the
+        # forward tensor's stop_gradient back.
+        ctx.needs_grad = (
+            not query.stop_gradient,
+            not key.stop_gradient,
+            not value.stop_gradient,
+            learnable_sink is not None and not learnable_sink.stop_gradient,
+        )
         return [out, lse]
 
     @staticmethod
@@ -3134,6 +3145,8 @@ class FlashMaskFunc(paddle.autograd.PyLayer):
             )
         else:
             flashmask_info = None
+        # learnable_sink is still handed to the backward kernel even when it is
+        # frozen: it shifts the softmax normalisation, so dq/dk/dv depend on it.
         dq, dk, dv, dsink = _flash_attn_bwd(
             query,
             key,
@@ -3148,9 +3161,17 @@ class FlashMaskFunc(paddle.autograd.PyLayer):
             learnable_sink=learnable_sink,
             group=ctx.group,
         )
+        q_needs, k_needs, v_needs, sink_needs = ctx.needs_grad
+        grads = (
+            dq if q_needs else None,
+            dk if k_needs else None,
+            dv if v_needs else None,
+        )
+        # A None sink is not a forward input at all, so it owns no slot; a frozen
+        # one owns a slot that must be None.
         if learnable_sink is None:
-            return dq, dk, dv
-        return dq, dk, dv, dsink
+            return grads
+        return grads + (dsink if sink_needs else None,)
 
 # TODO(wusiming): should we align the parameters with those of paddle.nn.functional.flashmask_attention?
 def flashmask_attention(
