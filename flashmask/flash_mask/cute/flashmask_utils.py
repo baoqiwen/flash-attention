@@ -20,6 +20,7 @@
 
 from typing import Optional, NamedTuple
 from dataclasses import dataclass
+import warnings
 import paddle
 import cutlass
 import cutlass.cute as cute
@@ -1164,17 +1165,28 @@ def build_fwd_n_block_list_kernel(
 
         # Row window of the whole work tile, matching update_block_buffer's
         # m_block_s / m_block_e (which are in work-tile rows, not per-CTA rows).
+        # These feed the fully/partially predicates below and are CLAMPED to
+        # seqlen_q, exactly like update_block_buffer clamps them.
         m_block_s = m_tile * kBlockM
         m_block_e = cutlass.min(m_block_s + kBlockM, seqlen_q)
 
-        # Same n_block upper bound the kernel's BlockInfo.get_n_block_min_max gives.
-        # n_block_min is 0 here: this path is only taken for non-local masks.
+        # Causal n_block upper bound. This must reproduce
+        # BlockInfo.get_n_block_min_max, which uses the UNCLAMPED (m_block + 1) *
+        # tile_m -- NOT the clamped m_block_e above. The two differ on the last tile
+        # whenever seqlen_q is not a multiple of the work-tile M, and using the
+        # clamped value there yields a SMALLER n_block_max, i.e. this builder would
+        # drop KV blocks the kernel does visit and the output would be wrong. Note
+        # reduce_block_count_kernel clamps here too, but it only decides "is this
+        # tile completely empty", so the discrepancy is not equivalent.
+        # n_block_min is 0: this path is only taken for non-local masks.
         n_block_max = num_blocks
         if cutlass.const_expr(is_causal):
-            n_idx_right = m_block_e + seqlen_k - seqlen_q
+            m_idx_max = (m_tile + 1) * kBlockM
+            n_idx_right = m_idx_max + seqlen_k - seqlen_q
             n_block_max = cutlass.min(
                 n_block_max, (n_idx_right + kBlockN - 1) // kBlockN
             )
+            n_block_max = cutlass.max(n_block_max, cutlass.Int32(0))
 
         written = cutlass.Int32(0)
         chunk = cutlass.Int32(0)
@@ -1301,6 +1313,7 @@ def build_fwd_n_block_list(
     kBlockM: int,
     kBlockN: int,
     seqlen_q: int,
+    seqlen_k: int,
 ):
     """Build (or reuse) the SM100 forward's per-work-tile surviving-n_block list.
 
@@ -1308,11 +1321,26 @@ def build_fwd_n_block_list(
     allocation would exceed FWD_N_BLOCK_LIST_MAX_BYTES, in which case the caller
     should leave the forward on its in-kernel scan.
 
+    ``seqlen_k`` is the K length the KERNEL will use (from mK), passed separately so
+    it can be checked against the mask table's own length: the kernel derives
+    n_block_max from seqlen_info.seqlen_k while this builder walks the table, and if
+    the two ever disagree the list would cover a different block range than the
+    consumer expects.
+
     Requires prepare_block_maxmin to have filled the per-n_block max/min arrays.
     Cached on ``flashmask_info`` keyed by the tiling it was built for, so the layers
     of one micro-batch that share a mask build it once.
     """
-    batch, heads, seqlen_k, num_vecs = flashmask_info.startend_row_indices.shape
+    batch, heads, mask_seqlen_k, num_vecs = flashmask_info.startend_row_indices.shape
+    if mask_seqlen_k != seqlen_k:
+        # Not an assert: fall back rather than risk a mismatched list.
+        warnings.warn(
+            "flashmask fwd n_block list skipped: the mask table covers "
+            f"{mask_seqlen_k} key positions but the kernel will run with "
+            f"seqlen_k={seqlen_k}; the in-kernel scan is used instead.",
+            stacklevel=2,
+        )
+        return None, None
     num_m_tiles = (seqlen_q + kBlockM - 1) // kBlockM
     num_blocks = (seqlen_k + kBlockN - 1) // kBlockN
     chunk_stride = fwd_n_block_chunk_stride(kBlockN)
@@ -1331,6 +1359,17 @@ def build_fwd_n_block_list(
     width = chunks_max * chunk_stride
     nbytes = batch * heads * num_m_tiles * width * 4
     if nbytes > FWD_N_BLOCK_LIST_MAX_BYTES:
+        # Loud, because otherwise this looks like "the optimization did nothing".
+        # Masks with a per-head table (heads == num_heads) are what usually lands
+        # here: the worst-case size scales with batch * heads * m_tiles * seqlen_k.
+        warnings.warn(
+            "flashmask fwd n_block list skipped: worst-case allocation "
+            f"{nbytes / 1024**2:.1f} MiB (batch={batch}, flashmask heads={heads}, "
+            f"m tiles={num_m_tiles}, blocks={num_blocks}) exceeds the "
+            f"{FWD_N_BLOCK_LIST_MAX_BYTES / 1024**2:.0f} MiB budget; the fwd keeps "
+            "rescanning every n_block per work tile.",
+            stacklevel=2,
+        )
         return None, None
 
     if num_vecs == 4:

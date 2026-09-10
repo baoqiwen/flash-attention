@@ -343,6 +343,10 @@ def _flash_attn_fwd(
     # host instead of having the fwd's generate_block warp rescan every n_block for
     # every work tile. Set False to fall back to the in-kernel scan for A/B.
     flashmask_fwd_n_block_list: bool = True,
+    # SM100 only: swap the fwd grid so the head axis is grid.x, co-scheduling the q
+    # heads that share a KV head instead of the m_blocks of one head. None = auto
+    # (on when qhead_per_kvhead > 1 and the launch lands on SingleTileScheduler).
+    flashmask_fwd_head_major: Optional[bool] = None,
 ) -> Tuple[paddle.Tensor, paddle.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -588,32 +592,9 @@ def _flash_attn_fwd(
         if compute_capability != 9 and not reuse_block_count:
             reduce_block_count(cute_flashmask_info, causal, fwd_m_tile_rows, n_block_size, seqlen_q)
             flashmask_info.block_count_ctx = ctx
-        # Precompute the fwd's surviving-n_block list. Without it, generate_block
-        # rescans all ceil(seqlen_k / n_block_size) blocks for every work tile -- at
-        # S=65536 / n=64 that is 1032 blocks scanned per tile to find ~8 survivors,
-        # and it is redone for each of the 64 q heads even though the mask has a
-        # single flashmask head, so the identical classification is repeated 64x
-        # inside the attention kernel's critical path.
-        #
-        # Local (explicit sliding window) is excluded: the builder reproduces the
-        # kernel's n_block bounds for the dense and causal cases only, and silently
-        # disagreeing there would select the wrong blocks.
-        if (
-            compute_capability == 10
-            and flashmask_fwd_n_block_list
-            and window_size_left is None
-            and window_size_right is None
-            and seqlen_q is not None
-        ):
-            fm_n_block_list, fm_n_block_chunks = build_fwd_n_block_list(
-                flashmask_info,
-                causal,
-                fwd_m_tile_rows,
-                n_block_size,
-                seqlen_q,
-            )
-        else:
-            fm_n_block_list, fm_n_block_chunks = None, None
+        # The fwd n_block list is built further down, once seqlen_k is resolved --
+        # the builder has to be checked against the K length the kernel will
+        # actually use, not against the mask table's length alone.
 
     if page_table is not None:
         assert cu_seqlens_k is None, "page_table is not supported with cu_seqlens_k"
@@ -655,6 +636,37 @@ def _flash_attn_fwd(
         assert cu_seqlens_k.shape == [
             batch_size + 1,
         ], "cu_seqlens_k must have shape (batch_size + 1,)"
+
+    # Precompute the fwd's surviving-n_block list, now that seqlen_k is known.
+    # Without it, generate_block rescans all ceil(seqlen_k / n_block_size) blocks for
+    # every work tile -- at S=65536 / n=64 that is 1032 blocks scanned per tile to
+    # find ~8 survivors, and it is redone for each of the 64 q heads even though the
+    # mask has a single flashmask head, so the identical classification is repeated
+    # 64x inside the attention kernel's critical path.
+    #
+    # Excluded cases, all because the builder would have to reproduce a different
+    # n_block range than the kernel's BlockInfo gives it:
+    #   - local (explicit sliding window): n_block_min is no longer 0
+    #   - paged KV: seqlen_k comes from the page table, not from one contiguous K
+    #   - FM-4 overlap: seqlen_k is the gathered SRBuffer length
+    if (
+        cute_flashmask_info is not None
+        and compute_capability == 10
+        and flashmask_fwd_n_block_list
+        and window_size_left is None
+        and window_size_right is None
+        and seqlen_q is not None
+        and page_table is None
+        and not enable_overlap
+    ):
+        fm_n_block_list, fm_n_block_chunks = build_fwd_n_block_list(
+            flashmask_info,
+            causal,
+            fwd_m_tile_rows,
+            n_block_size,
+            seqlen_q,
+            seqlen_k,
+        )
 
     if cu_seqlens_q is not None:
         assert cu_seqlens_q.shape == [
@@ -858,6 +870,29 @@ def _flash_attn_fwd(
         causal, local = False, False
 
     current_stream = cuda.CUstream(paddle.device.current_stream().stream_base.cuda_stream)
+
+    # Head-major grid (SingleTileScheduler only). CUDA varies blockIdx.x fastest, so the
+    # default block-on-x mapping makes the co-resident CTAs different m_blocks of the
+    # SAME head; with GQA/MQA those all re-read the same K/V because nothing
+    # co-schedules the heads that share it. Putting heads on x co-schedules them on one
+    # m_block instead, so a KV block is fetched once and hit qhead_per_kvhead - 1 more
+    # times out of cache.
+    #
+    # Only worth it when a KV head is actually shared. Restricted to the cases that end
+    # up on SingleTileScheduler: varlen goes to SingleTileVarlenScheduler and
+    # causal/local to SingleTileLPTScheduler, both of which ignore this flag (so passing
+    # it is harmless, it just does nothing there).
+    if flashmask_fwd_head_major is None:
+        fwd_head_major = (
+            compute_capability == 10
+            and qhead_per_kvhead > 1
+            and not causal
+            and not local
+            and cu_seqlens_q is None
+            and seqused_q is None
+        )
+    else:
+        fwd_head_major = flashmask_fwd_head_major
 
     # NOTE: do NOT bump n_block_size to 192 for the dense d=128 (non-causal,
     # non-flashmask) case. tile_n=192 with num_stages=2 sits right at Hopper's smem
@@ -1125,6 +1160,8 @@ def _flash_attn_fwd(
         flashmask_d512_unalias_sO_sQ,
         # Selects generate_block's copy-the-list path over the in-kernel scan.
         fm_n_block_list_tensor is not None,
+        # Changes the grid shape and the blockIdx -> (block, head) decode.
+        fwd_head_major,
     ) + (
         # SRBuffer K/V require a distinct artifact only when overlap is active.
         (overlap_bhsd_layout, overlap_kv_chunk_size) if enable_overlap else ()
@@ -1181,6 +1218,7 @@ def _flash_attn_fwd(
                 has_block_bos=block_bos is not None,
                 use_2cta_instrs=use_2cta_instrs,
                 flashmask_d512_unalias_sO_sQ=flashmask_d512_unalias_sO_sQ,
+                fwd_head_major=fwd_head_major,
             )
         else:
             raise ValueError(

@@ -149,6 +149,11 @@ class FlashAttentionForwardSm100:
         # config onto the persistent scheduler. Off by default -- see the block in
         # the setup below for the measurement that decided that default.
         flashmask_d512_unalias_sO_sQ: bool = False,
+        # Put the head axis on grid.x (SingleTileScheduler only) so that the CTAs
+        # co-resident on the GPU are heads of ONE m_block rather than m_blocks of one
+        # head. Only pays off when several q heads share a KV head and/or a mask; the
+        # host decides. See TileSchedulerArguments.head_major.
+        fwd_head_major: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -184,6 +189,7 @@ class FlashAttentionForwardSm100:
         self.use_2cta_instrs = use_2cta_instrs
         self.cta_group_size = 2 if use_2cta_instrs else 1
         self.flashmask_d512_unalias_sO_sQ = flashmask_d512_unalias_sO_sQ
+        self.fwd_head_major = fwd_head_major
 
         # 2 Q tile per CTA
         self.cta_tiler = (self.q_stage * m_block_size, n_block_size, self.head_dim_padded)
@@ -1268,6 +1274,9 @@ class FlashAttentionForwardSm100:
             # num_block above is counted in work_tile_m (= cta_tiler[0] * cta_group_size)
             # rows, i.e. per CTA PAIR, so the whole cluster must resolve the same tile.
             cluster_share_tile=self.cta_group_size > 1,
+            # Only SingleTileScheduler reads this; the LPT / persistent variants ignore
+            # it, so it is safe to pass unconditionally.
+            head_major=self.fwd_head_major,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         self.tile_scheduler_cls = TileScheduler

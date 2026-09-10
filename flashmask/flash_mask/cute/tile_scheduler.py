@@ -81,6 +81,22 @@ class TileSchedulerArguments(ParamsBase):
     is_persistent: cutlass.Constexpr[bool] = False
     lpt: cutlass.Constexpr[bool] = False
     is_split_kv: cutlass.Constexpr[bool] = False
+    # Put the head axis on grid.x instead of grid.y (SingleTileScheduler only).
+    #
+    # CUDA launches blocks with x varying fastest, so the default (block on x, head on
+    # y) makes the CTAs resident at any instant a set of DIFFERENT m_blocks of the SAME
+    # head. Those walk different KV blocks, so when several q heads share one KV head
+    # -- GQA, and MQA in particular -- none of that sharing is captured by the caches:
+    # each head re-reads the same K/V from DRAM.
+    #
+    # With head_major the resident CTAs are instead many heads of the SAME m_block, all
+    # reading the identical KV blocks, which is what turns qhead_per_kvhead reads of a
+    # block into one miss plus qhead_per_kvhead - 1 hits.
+    #
+    # Only valid where a cluster resolves ONE work tile (cluster_share_tile) or there is
+    # no cluster: the per-CTA-block convention needs adjacent n_blocks inside a cluster,
+    # which putting heads on x would break.
+    head_major: cutlass.Constexpr[bool] = False
 
 
 class SingleTileScheduler:
@@ -94,11 +110,19 @@ class SingleTileScheduler:
         is_split_kv: cutlass.Constexpr[bool] = False
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
         cluster_share_tile: cutlass.Constexpr[bool] = False
+        head_major: cutlass.Constexpr[bool] = False
 
         @staticmethod
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "SingleTileScheduler.Params":
+            assert not args.head_major or (
+                args.cluster_share_tile or args.cluster_shape_mn[0] == 1
+            ), (
+                "head_major needs one work tile per cluster (cluster_share_tile) or no "
+                "cluster: the per-CTA-block convention requires adjacent n_blocks "
+                "inside a cluster, which heads on grid.x would break"
+            )
             return SingleTileScheduler.Params(
                 args.num_block,
                 args.num_head,
@@ -108,6 +132,7 @@ class SingleTileScheduler:
                 args.is_split_kv,
                 args.cluster_shape_mn,
                 args.cluster_share_tile,
+                args.head_major,
             )
 
     def __init__(self, params: Params, blk_coord: cute.Coord, *, loc=None, ip=None):
@@ -123,8 +148,18 @@ class SingleTileScheduler:
 
     @staticmethod
     def create(params: Params, *, loc=None, ip=None) -> "SingleTileScheduler":
-        blk_coord = cute.arch.block_idx()
-        if const_expr(params.cluster_share_tile and params.cluster_shape_mn[0] > 1):
+        raw = cute.arch.block_idx()
+        # Normalise to the canonical (block, head, batch) order here so that
+        # get_current_work below never has to know which axis carried what.
+        if const_expr(params.head_major):
+            # grid.x is the (head, split) axis, grid.y is the block axis.
+            head_x = (
+                raw[0] // params.cluster_shape_mn[0]
+                if const_expr(params.cluster_share_tile and params.cluster_shape_mn[0] > 1)
+                else raw[0]
+            )
+            blk_coord = (raw[1], head_x, raw[2])
+        elif const_expr(params.cluster_share_tile and params.cluster_shape_mn[0] > 1):
             # 2-CTA UMMA with a shared work tile: every CTA of a cluster resolves the SAME
             # tile and the MMA splits the tile's M rows across the pair. Keeping the tile
             # index shared is what keeps the flashmask block list / valid_block_count
@@ -132,10 +167,12 @@ class SingleTileScheduler:
             # never block each other on a skipped block). Only kernels that opt in via
             # cluster_share_tile want this; see TileSchedulerArguments.cluster_share_tile.
             blk_coord = (
-                blk_coord[0] // params.cluster_shape_mn[0],
-                blk_coord[1],
-                blk_coord[2],
+                raw[0] // params.cluster_shape_mn[0],
+                raw[1],
+                raw[2],
             )
+        else:
+            blk_coord = raw
         return SingleTileScheduler(params, blk_coord, loc=loc, ip=ip)
 
     # called by host
@@ -148,6 +185,16 @@ class SingleTileScheduler:
     ) -> Tuple[Int32, Int32, Int32]:
         # TODO: this hard-codes the fact that we only use cluster = (1, 1) or (2, 1)
         assert params.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] == 1 is supported"
+        if const_expr(params.head_major):
+            # Heads on x so that the CTAs co-resident on the GPU are heads of one
+            # m_block (sharing KV) rather than m_blocks of one head (sharing nothing).
+            heads_x = params.num_head * params.num_splits
+            num_blk_x = (
+                heads_x * params.cluster_shape_mn[0]
+                if const_expr(params.cluster_share_tile)
+                else cute.round_up(heads_x, params.cluster_shape_mn[0])
+            )
+            return (num_blk_x, params.num_block, params.num_batch)
         # Shared tile: num_block counts CTA-pair tiles, so the grid needs one block per CTA.
         # Otherwise num_block already counts per-CTA blocks and only has to be rounded up to
         # a whole number of clusters.
