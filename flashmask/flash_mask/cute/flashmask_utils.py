@@ -101,6 +101,27 @@ class FlashMaskInfoPaddle:
     UTE_nblock_max: Optional[paddle.Tensor] = None
     UTE_nblock_min: Optional[paddle.Tensor] = None
     valid_block_count: Optional[paddle.Tensor] = None
+    # Set by the forward when it fills valid_block_count, so that a caller reusing
+    # this object across layers can be checked instead of trusted: the reduction is
+    # only valid for the (is_causal, m_tile_rows, n_block_size, seqlen_q) it ran
+    # with. Compared in _flash_attn_fwd; a mismatch raises rather than silently
+    # feeding the kernel a block count for a different tiling.
+    block_count_ctx: Optional[tuple] = None
+    # Cached to_cute_flashmask_info result. The conversion is ~9 from_dlpack calls
+    # and is pure host work; once the arrays above are filled they never change, so
+    # a caller reusing this object across layers should not pay for it again. The
+    # cute tensors alias the paddle buffers held by this same object, so their
+    # pointers stay valid for as long as the cache does.
+    cute_info: Optional[object] = None
+    # Precomputed per-(batch, flashmask head, m tile) surviving-n_block list for the
+    # SM100 forward, in exactly the encoding its `s_n_block` consumer expects (see
+    # build_fwd_n_block_list). Lets the fwd's generate_block warp copy a short list
+    # instead of rescanning all ceil(seqlen_k / kBlockN) blocks per work tile.
+    # fwd_n_block_ctx pins the tiling it was built for, same contract as
+    # block_count_ctx.
+    fwd_n_block_list: Optional[paddle.Tensor] = None
+    fwd_n_block_chunks: Optional[paddle.Tensor] = None
+    fwd_n_block_ctx: Optional[tuple] = None
 
 
 def _compute_nblock_seqlen(seqlen_k: int, kBlockN: int) -> int:
@@ -244,6 +265,23 @@ def prepare_block_maxmin(flashmask_info: FlashMaskInfoPaddle, kBlockN: int = 128
     batch, heads, seqlen_k, num_vecs = flashmask_info.startend_row_indices.shape
     nblocks = _compute_nblock_seqlen(seqlen_k, kBlockN)
 
+    # An info that is already prepared is reusable: one bounds table is shared by
+    # every layer with the same mask, so rescanning it is pure repeat work.
+    # LTS_nblock_max is filled by every branch below, so it is the sentinel. The
+    # scan granularity is baked into the trailing dim, so an info prepared for a
+    # different kBlockN is rejected -- reusing it would feed the kernel max/min
+    # values for the wrong block size. Without this early return the "all None"
+    # guards below all miss and the function falls through to the raise at the end.
+    if flashmask_info.LTS_nblock_max is not None:
+        have = flashmask_info.LTS_nblock_max.shape[-1]
+        if have != nblocks:
+            raise ValueError(
+                f"flashmask_info is already prepared with {have} n blocks, but "
+                f"kBlockN={kBlockN} needs {nblocks}; keep one info per kBlockN "
+                "(the forward and backward tile sizes differ)"
+            )
+        return
+
     if num_vecs == 1 and flashmask_info.LTS_nblock_max is None and flashmask_info.LTS_nblock_min is None:
         flashmask_info.LTS_nblock_max = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
         flashmask_info.LTS_nblock_min = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
@@ -307,6 +345,12 @@ def to_cute_flashmask_info(flashmask_info: FlashMaskInfoPaddle) -> Optional[Flas
     if not is_flashmask_enabled(flashmask_info):
         return None
 
+    # Reuse the conversion when this object has been through here before. Only the
+    # array contents ever change after that (reduce_block_count writes through the
+    # cached view), never their identity or layout.
+    if flashmask_info.cute_info is not None:
+        return flashmask_info.cute_info
+
     batch, heads, seqlen_k, num_vecs = flashmask_info.startend_row_indices.shape
 
     startend_row_indices_tensor = from_dlpack(flashmask_info.startend_row_indices, assumed_align=4).mark_layout_dynamic(leading_dim=3)
@@ -349,7 +393,7 @@ def to_cute_flashmask_info(flashmask_info: FlashMaskInfoPaddle) -> Optional[Flas
     else:
         valid_block_count = None
 
-    return FlashMaskInfo(
+    flashmask_info.cute_info = FlashMaskInfo(
         flashmask_info.is_causal,
         startend_row_indices_tensor,
         LTS_nblock_max_tensor,
@@ -362,6 +406,7 @@ def to_cute_flashmask_info(flashmask_info: FlashMaskInfoPaddle) -> Optional[Flas
         UTE_nblock_min_tensor,
         valid_block_count
     )
+    return flashmask_info.cute_info
 
 @cute.kernel
 def reduce_block_count_kernel(
@@ -1031,3 +1076,340 @@ def build_flashmask_block_lists(
 
 
 build_flashmask_block_lists.compile_cache = {}
+
+
+# Terminator sentinels for the precomputed forward n_block list. These MUST stay
+# equal to FlashAttentionForwardSm100.generate_block_incomplete / _finish: the fwd
+# consumer (n_block_getter) recognises them by value, and its decode branch keys on
+# `encoded <= 0x80000001` interpreted as a signed int32.
+FWD_N_BLOCK_INCOMPLETE = 0x80000001
+FWD_N_BLOCK_FINISH = 0x80000000
+
+
+def fwd_n_block_chunk_stride(n_block_size: int) -> int:
+    """Entries per chunk of the precomputed list = the fwd's smem buffer capacity.
+
+    Must equal FlashAttentionForwardSm100.generate_block_buffer_usable_block_count,
+    which is the number of int32s of `s_n_block` one pipeline stage owns. Duplicated
+    as a Python int here (the kernel keeps it as an Int32) so the host allocation and
+    the kernel's copy loop cannot drift apart -- note it is NOT a constant: it drops
+    from 256 to 64 once n_block_size < 64.
+
+    One int32 of every chunk is reserved for that chunk's terminator (chunk_capacity =
+    stride - 1 entries), so a chunk handed to the kernel always carries its own end
+    marker and the fwd's `s_extra_flags` spill slot is never needed on this path.
+    """
+    gb_seqlen_k = 16384 if n_block_size >= 64 else 64 * n_block_size
+    return ((gb_seqlen_k + n_block_size - 1) // n_block_size + 3) // 4 * 4
+
+
+# Host-side budget for the list allocation. Sized for the worst case (every block
+# survives in every tile), so a mask with many flashmask heads and a long KV can ask
+# for far more than it will use; above this the caller keeps the in-kernel scan.
+FWD_N_BLOCK_LIST_MAX_BYTES = 64 * 1024 * 1024
+
+
+@cute.kernel
+def build_fwd_n_block_list_kernel(
+    LTS_nblock_max: cute.Tensor,  # [b, h_fm, nblocks_padded]
+    LTS_nblock_min: cute.Tensor,
+    LTE_nblock_max: cute.Tensor,
+    LTE_nblock_min: cute.Tensor,
+    UTS_nblock_max: cute.Tensor,
+    UTS_nblock_min: cute.Tensor,
+    UTE_nblock_max: cute.Tensor,
+    UTE_nblock_min: cute.Tensor,
+    n_block_list: cute.Tensor,    # [b, h_fm, num_m_tiles, chunks_max * chunk_stride]
+    n_block_chunks: cute.Tensor,  # [b, h_fm, num_m_tiles]
+    num_m_tiles: cutlass.Int32,
+    num_blocks: cutlass.Int32,
+    batch_size: cutlass.Int32,
+    h_flashmask: cutlass.Int32,
+    kBlockM: cutlass.Int32,
+    kBlockN: cutlass.Int32,
+    seqlen_q: cutlass.Int32,
+    seqlen_k: cutlass.Int32,
+    chunk_stride: cutlass.Constexpr[int],
+    chunk_capacity: cutlass.Constexpr[int],
+    is_causal: cutlass.Constexpr[bool],
+    has_lte: cutlass.Constexpr[bool],
+    has_uts: cutlass.Constexpr[bool],
+    has_ute: cutlass.Constexpr[bool],
+):
+    """One thread per (batch, flashmask head, m tile): walk n_block DESCENDING and
+    append the surviving blocks in the fwd's own encoding.
+
+    The order and the encoding are dictated by the consumer, not chosen here:
+    FlashAttentionForwardSm100.update_block_buffer writes descending n_block, encodes
+    a partially-masked block as `n_block` and a fully-visible one as `-n_block - 1`,
+    and terminates a buffer with `incomplete` (more to come) or `finish` (last). The
+    classification predicates below are copied from that function so that every block
+    lands in the same class it would have in the in-kernel scan.
+
+    One thread rather than one warp on purpose: the chunk layout is a running append,
+    which a warp would need a prefix sum for (that is what the in-kernel version does,
+    and it is the cost being removed here). This kernel runs once per (mask, tiling),
+    not once per work tile, so the serial walk is not on any hot path.
+    """
+    tidx = cute.arch.thread_idx()[0]
+    bidx = cute.arch.block_idx()[0]
+    bdim = cute.arch.block_dim()[0]
+    gid = tidx + bidx * bdim
+
+    total = batch_size * h_flashmask * num_m_tiles
+    if gid < total:
+        m_tile = gid % num_m_tiles
+        head_idx = (gid // num_m_tiles) % h_flashmask
+        batch_idx = gid // (h_flashmask * num_m_tiles)
+
+        # Row window of the whole work tile, matching update_block_buffer's
+        # m_block_s / m_block_e (which are in work-tile rows, not per-CTA rows).
+        m_block_s = m_tile * kBlockM
+        m_block_e = cutlass.min(m_block_s + kBlockM, seqlen_q)
+
+        # Same n_block upper bound the kernel's BlockInfo.get_n_block_min_max gives.
+        # n_block_min is 0 here: this path is only taken for non-local masks.
+        n_block_max = num_blocks
+        if cutlass.const_expr(is_causal):
+            n_idx_right = m_block_e + seqlen_k - seqlen_q
+            n_block_max = cutlass.min(
+                n_block_max, (n_idx_right + kBlockN - 1) // kBlockN
+            )
+
+        written = cutlass.Int32(0)
+        chunk = cutlass.Int32(0)
+        nb = n_block_max - 1
+        while nb >= 0:
+            lt_start_max = cutlass.Int32(LTS_nblock_max[batch_idx, head_idx, nb])
+            lt_start_min = cutlass.Int32(LTS_nblock_min[batch_idx, head_idx, nb])
+            fully_masked = True
+            partially_masked = False
+            if cutlass.const_expr(has_uts):
+                lt_end_max = cutlass.Int32(LTE_nblock_max[batch_idx, head_idx, nb])
+                lt_end_min = cutlass.Int32(LTE_nblock_min[batch_idx, head_idx, nb])
+                ut_start_max = cutlass.Int32(UTS_nblock_max[batch_idx, head_idx, nb])
+                ut_start_min = cutlass.Int32(UTS_nblock_min[batch_idx, head_idx, nb])
+                ut_end_max = cutlass.Int32(UTE_nblock_max[batch_idx, head_idx, nb])
+                ut_end_min = cutlass.Int32(UTE_nblock_min[batch_idx, head_idx, nb])
+                fully_masked = (m_block_s >= lt_start_max and m_block_e <= lt_end_min) or (
+                    m_block_s >= ut_start_max and m_block_e <= ut_end_min
+                )
+                partially_masked = (m_block_s < lt_end_max and m_block_e > lt_start_min) or (
+                    m_block_s < ut_end_max and m_block_e > ut_start_min
+                )
+            elif cutlass.const_expr(has_lte):
+                lt_end_max = cutlass.Int32(LTE_nblock_max[batch_idx, head_idx, nb])
+                lt_end_min = cutlass.Int32(LTE_nblock_min[batch_idx, head_idx, nb])
+                fully_masked = m_block_s >= lt_start_max and m_block_e <= lt_end_min
+                partially_masked = m_block_s < lt_end_max and m_block_e > lt_start_min
+            elif cutlass.const_expr(has_ute):
+                ut_end_max = cutlass.Int32(UTE_nblock_max[batch_idx, head_idx, nb])
+                ut_end_min = cutlass.Int32(UTE_nblock_min[batch_idx, head_idx, nb])
+                fully_masked = (m_block_s >= lt_start_max) or (m_block_e <= ut_end_min)
+                partially_masked = (m_block_e > lt_start_min) or (m_block_s < ut_end_max)
+            else:
+                fully_masked = m_block_s >= lt_start_max
+                partially_masked = m_block_e > lt_start_min
+
+            if not fully_masked:
+                n_block_list[
+                    batch_idx, head_idx, m_tile, chunk * chunk_stride + written
+                ] = (nb if partially_masked else (-nb - 1))
+                written += 1
+                if written == cutlass.Int32(chunk_capacity):
+                    # Chunk is full: close it with `incomplete` so the consumer knows
+                    # to come back for another buffer, and start the next one.
+                    n_block_list[
+                        batch_idx, head_idx, m_tile, chunk * chunk_stride + written
+                    ] = cutlass.Int32(FWD_N_BLOCK_INCOMPLETE)
+                    chunk += 1
+                    written = cutlass.Int32(0)
+            nb -= 1
+
+        # Always terminate. An all-masked tile yields chunk 0 holding only `finish`,
+        # which is what the consumer's empty-tile fast path expects to read first.
+        n_block_list[
+            batch_idx, head_idx, m_tile, chunk * chunk_stride + written
+        ] = cutlass.Int32(FWD_N_BLOCK_FINISH)
+        n_block_chunks[batch_idx, head_idx, m_tile] = chunk + 1
+
+
+@cute.jit
+def build_fwd_n_block_list_cute(
+    LTS_nblock_max: cute.Tensor,
+    LTS_nblock_min: cute.Tensor,
+    LTE_nblock_max: cute.Tensor,
+    LTE_nblock_min: cute.Tensor,
+    UTS_nblock_max: cute.Tensor,
+    UTS_nblock_min: cute.Tensor,
+    UTE_nblock_max: cute.Tensor,
+    UTE_nblock_min: cute.Tensor,
+    n_block_list: cute.Tensor,
+    n_block_chunks: cute.Tensor,
+    num_m_tiles: cutlass.Int32,
+    num_blocks: cutlass.Int32,
+    batch_size: cutlass.Int32,
+    h_flashmask: cutlass.Int32,
+    kBlockM: cutlass.Int32,
+    kBlockN: cutlass.Int32,
+    seqlen_q: cutlass.Int32,
+    seqlen_k: cutlass.Int32,
+    total_threads: cutlass.Int32,
+    chunk_stride: cutlass.Constexpr[int],
+    chunk_capacity: cutlass.Constexpr[int],
+    is_causal: cutlass.Constexpr[bool],
+    has_lte: cutlass.Constexpr[bool],
+    has_uts: cutlass.Constexpr[bool],
+    has_ute: cutlass.Constexpr[bool],
+    stream: cuda.CUstream,
+):
+    build_fwd_n_block_list_kernel(
+        LTS_nblock_max,
+        LTS_nblock_min,
+        LTE_nblock_max if LTE_nblock_max is not None else None,
+        LTE_nblock_min if LTE_nblock_min is not None else None,
+        UTS_nblock_max if UTS_nblock_max is not None else None,
+        UTS_nblock_min if UTS_nblock_min is not None else None,
+        UTE_nblock_max if UTE_nblock_max is not None else None,
+        UTE_nblock_min if UTE_nblock_min is not None else None,
+        n_block_list,
+        n_block_chunks,
+        num_m_tiles,
+        num_blocks,
+        batch_size,
+        h_flashmask,
+        kBlockM,
+        kBlockN,
+        seqlen_q,
+        seqlen_k,
+        chunk_stride,
+        chunk_capacity,
+        is_causal,
+        has_lte,
+        has_uts,
+        has_ute,
+    ).launch(
+        grid=[(total_threads + 127) // 128, 1, 1],
+        block=[cutlass.Int32(128), cutlass.Int32(1), cutlass.Int32(1)],
+        stream=stream,
+    )
+
+
+def build_fwd_n_block_list(
+    flashmask_info: "FlashMaskInfoPaddle",
+    is_causal: bool,
+    kBlockM: int,
+    kBlockN: int,
+    seqlen_q: int,
+):
+    """Build (or reuse) the SM100 forward's per-work-tile surviving-n_block list.
+
+    Returns ``(n_block_list, n_block_chunks)`` or ``(None, None)`` when the worst-case
+    allocation would exceed FWD_N_BLOCK_LIST_MAX_BYTES, in which case the caller
+    should leave the forward on its in-kernel scan.
+
+    Requires prepare_block_maxmin to have filled the per-n_block max/min arrays.
+    Cached on ``flashmask_info`` keyed by the tiling it was built for, so the layers
+    of one micro-batch that share a mask build it once.
+    """
+    batch, heads, seqlen_k, num_vecs = flashmask_info.startend_row_indices.shape
+    num_m_tiles = (seqlen_q + kBlockM - 1) // kBlockM
+    num_blocks = (seqlen_k + kBlockN - 1) // kBlockN
+    chunk_stride = fwd_n_block_chunk_stride(kBlockN)
+    chunk_capacity = chunk_stride - 1
+
+    ctx = (is_causal, kBlockM, kBlockN, seqlen_q, seqlen_k, num_m_tiles, num_blocks)
+    if (
+        flashmask_info.fwd_n_block_list is not None
+        and flashmask_info.fwd_n_block_ctx == ctx
+    ):
+        return flashmask_info.fwd_n_block_list, flashmask_info.fwd_n_block_chunks
+
+    # Worst case is every block surviving in every tile, each chunk holding
+    # chunk_capacity of them plus its terminator.
+    chunks_max = max(1, (num_blocks + chunk_capacity - 1) // chunk_capacity)
+    width = chunks_max * chunk_stride
+    nbytes = batch * heads * num_m_tiles * width * 4
+    if nbytes > FWD_N_BLOCK_LIST_MAX_BYTES:
+        return None, None
+
+    if num_vecs == 4:
+        has_lte, has_uts, has_ute = True, True, True
+    elif num_vecs == 2:
+        if flashmask_info.is_causal:
+            has_lte, has_uts, has_ute = True, False, False
+        else:
+            has_lte, has_uts, has_ute = False, False, True
+    else:
+        has_lte, has_uts, has_ute = False, False, False
+
+    n_block_list = paddle.empty(
+        [batch, heads, num_m_tiles, width], dtype=paddle.int32
+    )
+    n_block_chunks = paddle.empty([batch, heads, num_m_tiles], dtype=paddle.int32)
+
+    def _c(t, leading_dim):
+        if t is None:
+            return None
+        return from_dlpack(t, assumed_align=4).mark_layout_dynamic(
+            leading_dim=leading_dim
+        )
+
+    current_stream = cuda.CUstream(
+        paddle.device.current_stream().stream_base.cuda_stream
+    )
+    total_threads = batch * heads * num_m_tiles
+
+    args = (
+        _c(flashmask_info.LTS_nblock_max, 2),
+        _c(flashmask_info.LTS_nblock_min, 2),
+        _c(flashmask_info.LTE_nblock_max, 2),
+        _c(flashmask_info.LTE_nblock_min, 2),
+        _c(flashmask_info.UTS_nblock_max, 2),
+        _c(flashmask_info.UTS_nblock_min, 2),
+        _c(flashmask_info.UTE_nblock_max, 2),
+        _c(flashmask_info.UTE_nblock_min, 2),
+        _c(n_block_list, 3),
+        _c(n_block_chunks, 2),
+        cutlass.Int32(num_m_tiles),
+        cutlass.Int32(num_blocks),
+        cutlass.Int32(batch),
+        cutlass.Int32(heads),
+        cutlass.Int32(kBlockM),
+        cutlass.Int32(kBlockN),
+        cutlass.Int32(seqlen_q),
+        cutlass.Int32(seqlen_k),
+        cutlass.Int32(total_threads),
+    )
+    compile_key = (
+        is_causal,
+        has_lte,
+        has_uts,
+        has_ute,
+        chunk_stride,
+        chunk_capacity,
+    )
+    if compile_key not in build_fwd_n_block_list.compile_cache:
+        build_fwd_n_block_list.compile_cache[compile_key] = cute.compile(
+            build_fwd_n_block_list_cute,
+            *args,
+            chunk_stride,
+            chunk_capacity,
+            is_causal,
+            has_lte,
+            has_uts,
+            has_ute,
+            current_stream,
+        )
+    build_fwd_n_block_list.compile_cache[compile_key](
+        *args,
+        current_stream,
+    )
+
+    flashmask_info.fwd_n_block_list = n_block_list
+    flashmask_info.fwd_n_block_chunks = n_block_chunks
+    flashmask_info.fwd_n_block_ctx = ctx
+    return n_block_list, n_block_chunks
+
+
+build_fwd_n_block_list.compile_cache = {}

@@ -64,11 +64,16 @@ from flash_mask.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     StaticPersistentTileScheduler,
+    StaticPersistentClusterSharedTileScheduler,
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
     ParamsBase,
 )
-from flash_mask.cute.flashmask_utils import FlashMaskInfo, OverlapInfo
+from flash_mask.cute.flashmask_utils import (
+    FlashMaskInfo,
+    OverlapInfo,
+    fwd_n_block_chunk_stride,
+)
 
 
 @cute.jit
@@ -140,6 +145,10 @@ class FlashAttentionForwardSm100:
         block_size: cutlass.Constexpr[int] = 64,
         has_block_bos: cutlass.Constexpr = False,
         use_2cta_instrs: bool = False,
+        # d=dv=512 flashmask only: un-alias sO from sQ, which is what allows this
+        # config onto the persistent scheduler. Off by default -- see the block in
+        # the setup below for the measurement that decided that default.
+        flashmask_d512_unalias_sO_sQ: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -174,6 +183,7 @@ class FlashAttentionForwardSm100:
         # `m_block_size`.
         self.use_2cta_instrs = use_2cta_instrs
         self.cta_group_size = 2 if use_2cta_instrs else 1
+        self.flashmask_d512_unalias_sO_sQ = flashmask_d512_unalias_sO_sQ
 
         # 2 Q tile per CTA
         self.cta_tiler = (self.q_stage * m_block_size, n_block_size, self.head_dim_padded)
@@ -767,6 +777,12 @@ class FlashAttentionForwardSm100:
         flashmask_info: Optional[FlashMaskInfo] = None,
         mBlockLogit: Optional[cute.Tensor] = None,
         mBlockBos: Optional[cute.Tensor] = None,
+        # Precomputed surviving-n_block list for the flashmask forward, built once per
+        # (mask, tiling) by flashmask_utils.build_fwd_n_block_list. When present the
+        # generate_block warp copies it instead of rescanning every n_block per work
+        # tile; when None the in-kernel scan is used unchanged.
+        mFmNBlockList: Optional[cute.Tensor] = None,
+        mFmNBlockChunks: Optional[cute.Tensor] = None,
         overlap_k_addr: Optional[cutlass.Int64] = None,
         overlap_v_addr: Optional[cutlass.Int64] = None,
         overlap_write_ptr_addr: Optional[cutlass.Int64] = None,
@@ -797,6 +813,12 @@ class FlashAttentionForwardSm100:
         self.has_lt_end = const_expr(flashmask_info is not None and flashmask_info.LTE_nblock_max is not None)
         self.has_ut_start = const_expr(flashmask_info is not None and flashmask_info.UTS_nblock_max is not None)
         self.has_ut_end = const_expr(flashmask_info is not None and flashmask_info.UTE_nblock_max is not None)
+        # Precomputed n_block list available? When it is, generate_block copies it and
+        # the per-work-tile scan of every n_block (and the smem max/min staging that
+        # feeds it) is skipped entirely.
+        self.use_fwd_n_block_list = const_expr(
+            flashmask_info is not None and mFmNBlockList is not None
+        )
         # FM-4 overlap: K/V live in the NVSHMEM SRBuffer (no Paddle tensor / dlpack
         # capsule), so they arrive as a raw addr + the gathered (B, S_total, H, D)
         # dims as RUNTIME Int32 scalars. Build the views HERE -- make_*_from_addr
@@ -1168,6 +1190,33 @@ class FlashAttentionForwardSm100:
         )
         if const_expr(self.enable_flashmask):
             self.overlap_sO_sQ = True
+        # d=dv=512 flashmask: un-aliasing sO from sQ is what lets this config stay on
+        # the persistent scheduler. Aliasing sO onto sQ serialises the tile boundary --
+        # tile i's O has to drain out of sQ before tile i+1's Q can land in it -- which
+        # is exactly the overlap a persistent schedule exists to get.
+        #
+        # It is OFF by default because at S=65536 it loses badly. Measured d512
+        # flashmask fwd, B=1 H=64 window=128 ratio=128:
+        #   alias on,  non-persistent : 10.4862 ms   (log_perf2)
+        #   alias off, persistent     : 11.1211 ms   (log_perf)   -> +0.6349 ms
+        # The +64 KiB of SMEM it costs takes the block to 222/227 KiB, leaving almost
+        # no L1 for this kernel's register spills (SMEM and L1 share one pool), and at
+        # 64k there is nothing for persistence to win back: the grid is
+        # ceil(65536/128) * 64 = 32768 work tiles against ~148 SMs, so the tail effect
+        # persistence removes is already negligible. The earlier +0.15 ms estimate for
+        # the overlap (100.5 ns of Q-in/O-out per work tile against 74.7 ns of KV loop)
+        # was taken at a much shorter sequence and does not carry over.
+        #
+        # Kept as an explicit opt-in rather than a seqlen/tile-count heuristic: the only
+        # shape where it is known to help is S=4096, and only by ~0.04 ms, which is not
+        # enough signal to fit a threshold to. Add one here once there is a sweep.
+        if const_expr(
+            self.enable_flashmask
+            and self.head_dim_padded == 512
+            and self.head_dim_v_padded == 512
+            and self.flashmask_d512_unalias_sO_sQ
+        ):
+            self.overlap_sO_sQ = False
         if const_expr(self.overlap_sO_sQ):
             self.is_persistent = False
 
@@ -1176,7 +1225,16 @@ class FlashAttentionForwardSm100:
         elif const_expr(self.is_causal or self.is_local):
             TileScheduler = SingleTileLPTScheduler
         elif const_expr(self.is_persistent):
-            TileScheduler = StaticPersistentTileScheduler
+            # cluster_share_tile below is (cta_group_size > 1): with a 2-CTA UMMA one
+            # work tile IS one CTA pair, so the pair has to resolve the same tile and
+            # iterate the same number of times. StaticPersistentTileScheduler keys the
+            # tile off block_idx and strides by grid_dim, which splits the pair and
+            # deadlocks the cluster (one CTA reaches the TMEM dealloc handshake while
+            # its peer is still mid-tile). Use the cluster-keyed variant there.
+            if const_expr(self.cta_group_size > 1):
+                TileScheduler = StaticPersistentClusterSharedTileScheduler
+            else:
+                TileScheduler = StaticPersistentTileScheduler
         else:
             TileScheduler = SingleTileScheduler
 
@@ -1275,6 +1333,14 @@ class FlashAttentionForwardSm100:
         self.generate_block_buffer_block_count = Int32(Int32(((self.generate_block_seqlen_k + self.n_block_size - 1) // self.n_block_size + 31)) & 0xffffffe0)
         self.generate_block_buffer_usable_block_count = Int32(((self.generate_block_seqlen_k + self.n_block_size - 1) // self.n_block_size + 3) // 4 * 4)
         assert self.generate_block_buffer_usable_block_count % (len(self.generate_block_warp_ids) * cute.arch.WARP_SIZE) == 0
+        # Python-int twin of usable_block_count, for the precomputed-list copy loop
+        # (which needs a compile-time trip count) and for the host allocation. The
+        # helper is the single definition of this number; it is recomputed from
+        # n_block_size the same way the Int32 above is, so the two cannot drift.
+        self.fwd_n_block_chunk_stride = fwd_n_block_chunk_stride(self.n_block_size)
+        assert self.fwd_n_block_chunk_stride % (
+            len(self.generate_block_warp_ids) * cute.arch.WARP_SIZE
+        ) == 0
 
         @cute.struct
         class SharedStorage:
@@ -1401,6 +1467,8 @@ class FlashAttentionForwardSm100:
             flashmask_info,
             mBlockLogit if const_expr(self.has_block_logit) else None,
             mBlockBos if const_expr(self.has_block_bos) else None,
+            mFmNBlockList,
+            mFmNBlockChunks,
             overlap_info,
         ).launch(
             grid=grid_dim,
@@ -1450,6 +1518,8 @@ class FlashAttentionForwardSm100:
         flashmask_info: Optional[FlashMaskInfo] = None,
         mBlockLogit: Optional[cute.Tensor] = None,
         mBlockBos: Optional[cute.Tensor] = None,
+        mFmNBlockList: Optional[cute.Tensor] = None,
+        mFmNBlockChunks: Optional[cute.Tensor] = None,
         overlap_info: Optional[OverlapInfo] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
@@ -1763,6 +1833,8 @@ class FlashAttentionForwardSm100:
                     mQ.shape[2], # (s_q, d, h, b) or (total_q, d, h) if there is cu_seqlens_q
                     flashmask_info,
                     mbar_ptr,
+                    mFmNBlockList,
+                    mFmNBlockChunks,
                 )
         else:
             if warp_idx == self.generate_block_warp_ids[0]:
@@ -2031,6 +2103,8 @@ class FlashAttentionForwardSm100:
         num_heads: Int32,
         flashmask_info: FlashMaskInfo,
         mbar_ptr: cute.Tensor,
+        mFmNBlockList: Optional[cute.Tensor] = None,
+        mFmNBlockChunks: Optional[cute.Tensor] = None,
     ):
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -2048,7 +2122,60 @@ class FlashAttentionForwardSm100:
                 seqlen, m_block, split_idx, num_splits
             )
 
-            if n_block_min < n_block_max:
+            if const_expr(self.use_fwd_n_block_list):
+                # The surviving-block list was built on the host side, already in this
+                # buffer's encoding and already terminated per chunk, so there is
+                # nothing to classify here: publish it by copying.
+                #
+                # This is the whole point of the precomputed path. The scan below is
+                # O(ceil(seqlen_k / n_block_size)) per work tile no matter how few
+                # blocks survive -- 1032 blocks scanned to find ~8 at S=65536,
+                # repeated for every one of the 64 heads even though the mask (and
+                # hence the list) does not depend on the head at all. Here it is one
+                # gmem->smem copy of a short list per work tile.
+                if n_block_min < n_block_max:
+                    h_flashmask = flashmask_info.startend_row_indices.shape[1]
+                    h_h_flashmask_ratio = num_heads // h_flashmask
+                    bidh_fm = head_idx // h_h_flashmask_ratio
+                    num_generate_block_threads = cute.arch.WARP_SIZE * len(
+                        self.generate_block_warp_ids
+                    )
+                    tidx = cute.arch.thread_idx()[0] % num_generate_block_threads
+                    num_chunks = Int32(mFmNBlockChunks[batch_idx, bidh_fm, m_block])
+                    for chunk_idx in cutlass.range(num_chunks):
+                        cute.arch.mbarrier_wait(
+                            mbar_ptr
+                            + self.mbar_generate_block_empty_offset
+                            + generate_block_producer_state.index,
+                            generate_block_producer_state.phase,
+                        )
+                        s_n_block_cur = cute.make_tensor(
+                            s_n_block.iterator
+                            + self.generate_block_buffer_block_count
+                            * generate_block_producer_state.index,
+                            cute.make_layout(self.generate_block_buffer_block_count),
+                        )
+                        # The list is stored one chunk per fwd_n_block_chunk_stride
+                        # int32s; copying the whole stride is branch-free and the
+                        # consumer stops at the terminator inside it, so the tail
+                        # bytes are never read.
+                        base = chunk_idx * self.fwd_n_block_chunk_stride
+                        for it in cutlass.range_constexpr(
+                            self.fwd_n_block_chunk_stride
+                            // (len(self.generate_block_warp_ids) * cute.arch.WARP_SIZE)
+                        ):
+                            slot = tidx + it * num_generate_block_threads
+                            s_n_block_cur[slot] = mFmNBlockList[
+                                batch_idx, bidh_fm, m_block, base + slot
+                            ]
+                        cute.arch.sync_warp()
+                        cute.arch.mbarrier_arrive(
+                            mbar_ptr
+                            + self.mbar_generate_block_full_offset
+                            + generate_block_producer_state.index
+                        )
+                        generate_block_producer_state.advance()
+            elif n_block_min < n_block_max:
                 # for padding 32 and padding 4: the num_chunk (pad_32) >= num_chunk (pad_4) is always true
                 # TODO(wusiming): how does cutlass.Int32 store in binary?
                 # num_blocks = Int32(Int32((seqlen.seqlen_k + self.n_block_size - 1) // self.n_block_size + 3) & 0xfffffffc) # Note(wusiming): padding for int4 load
@@ -2610,9 +2737,15 @@ class FlashAttentionForwardSm100:
                     if n_block_first < n_block_min and n_block_first != Int32(self.generate_block_incomplete):
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_generate_block_empty_offset + generate_block_consumer_state.index)
                         generate_block_consumer_state.advance()
-                        tile_scheduler.prefetch_next_work()
-                        tile_scheduler.advance_to_next_work()
-                        work_tile = tile_scheduler.get_current_work()
+                        # Nothing to load for this tile. Do NOT advance the tile
+                        # scheduler here: the elif already skips the rest of the body,
+                        # and the loop tail advances once. Advancing twice made this
+                        # warp skip a whole work tile, which is invisible with a
+                        # single-tile scheduler (the second advance just re-invalidates)
+                        # but desynchronises it from the mma / correction / epilogue
+                        # warps -- each of which advances exactly once -- as soon as the
+                        # scheduler is persistent, and the mma warp then waits forever
+                        # for a KV stage nobody fills.
                     elif const_expr(not self.is_split_kv) or n_block_min < n_block_max:
                         if const_expr(self.use_tma_KV) or tidx < cute.arch.WARP_SIZE:
                             load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
@@ -3309,9 +3442,11 @@ class FlashAttentionForwardSm100:
                     if n_block_first < n_block_min and n_block_first != Int32(self.generate_block_incomplete):
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_generate_block_empty_offset + generate_block_consumer_state.index)
                         generate_block_consumer_state.advance()
-                        # Advance to next tile
-                        tile_scheduler.advance_to_next_work()
-                        work_tile = tile_scheduler.get_current_work()
+                        # No softmax work for this tile. Same reason as the load warp:
+                        # do NOT advance the tile scheduler here, the elif skips the body
+                        # and the loop tail advances once. Two advances desynchronise this
+                        # warp from mma / correction / epilogue under a persistent
+                        # scheduler.
                     elif const_expr(not self.is_split_kv) or tile_block_count > Int32(0):
 
                         mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, load_startend_row_indices_consumer_state = softmax_step(
@@ -4581,8 +4716,31 @@ class FlashAttentionForwardSm100:
                         )
                         cute.arch.cp_async_bulk_commit_group()
                     for stage in cutlass.range_constexpr(self.q_stage):
-                        # Ensure O0 / O1 buffer is ready to be released
-                        cute.arch.cp_async_bulk_wait_group(1 - stage, read=True)
+                        # Ensure O0 / O1 buffer is ready to be released. The count is
+                        # "how many stores may still be outstanding", so releasing
+                        # buffer `stage` requires every store up to and including it to
+                        # have been read out: q_stage - 1 - stage. The historical value
+                        # was 1 - stage, which is the same thing at q_stage == 2 but
+                        # leaves one store in flight at q_stage == 1.
+                        #
+                        # That slack is only unsafe when sO is reused by a LATER work
+                        # tile, i.e. under a persistent scheduler: the next tile's
+                        # correction warp would overwrite sO while this TMA is still
+                        # reading it. With one work tile per CTA there is no next tile
+                        # and the grid end drains the store, so the loose count is
+                        # correct there -- and it is measurably cheaper: tightening it
+                        # unconditionally cost +0.13 ms of the 10.36 ms d512 flashmask
+                        # fwd at S=65536 (log_base -> log_perf2), because at q_stage == 1
+                        # it turns wait_group(1) into a full wait_group(0) drain on a
+                        # path that never needed it.
+                        #
+                        # So gate on is_persistent rather than paying for it always.
+                        if const_expr(self.is_persistent):
+                            cute.arch.cp_async_bulk_wait_group(
+                                self.q_stage - 1 - stage, read=True
+                            )
+                        else:
+                            cute.arch.cp_async_bulk_wait_group(1 - stage, read=True)
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_corr_epi_empty_offset + stage)
                 else:
                     tidx = cute.arch.thread_idx()[0] % (

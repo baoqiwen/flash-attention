@@ -47,6 +47,7 @@ from flash_mask.cute.flashmask_utils import (
     reduce_block_count,
     compute_flashmask_block_lists,
     build_flashmask_block_lists,
+    build_fwd_n_block_list,
 )
 
 from flash_mask.cute.block_sparsity import (
@@ -328,11 +329,20 @@ def _flash_attn_fwd(
     out: Optional[paddle.Tensor] = None,
     lse: Optional[paddle.Tensor] = None,
     aux_tensors: Optional[list[paddle.Tensor]] = None,
-    startend_row_indices: Optional[paddle.Tensor] = None,
+    startend_row_indices: Optional[Union[FlashMaskInfoPaddle, paddle.Tensor]] = None,
     block_logit: Optional[paddle.Tensor] = None,
     block_size: int = 64,
     block_bos: Optional[paddle.Tensor] = None,
     group=None,
+    # d=dv=512 flashmask only: un-alias sO from sQ so the config can use the
+    # persistent scheduler. Off by default -- it measured +0.63 ms on the 10.36 ms
+    # S=65536 fwd (see FlashAttentionForwardSm100's setup for the numbers). Exposed
+    # so the alias/persistent arm can be A/B'd without editing the kernel.
+    flashmask_d512_unalias_sO_sQ: bool = False,
+    # SM100 flashmask only: precompute the per-work-tile surviving-n_block list on the
+    # host instead of having the fwd's generate_block warp rescan every n_block for
+    # every work tile. Set False to fall back to the in-kernel scan for A/B.
+    flashmask_fwd_n_block_list: bool = True,
 ) -> Tuple[paddle.Tensor, paddle.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -365,6 +375,15 @@ def _flash_attn_fwd(
 
     assert cu_seqlens_q is None, "cu_seqlens_q must be None (varlen is not supported in flashmask)"
     assert cu_seqlens_k is None, "cu_seqlens_k must be None (varlen is not supported in flashmask)"
+
+    # A caller may pass either the raw bounds table or an already-prepared
+    # FlashMaskInfoPaddle (the backward's flashmask_info argument takes the same
+    # union). Unwrap here, before anything reads .shape off it, and keep the
+    # prebuilt object in prebuilt_flashmask_info for the block below.
+    prebuilt_flashmask_info = None
+    if isinstance(startend_row_indices, FlashMaskInfoPaddle):
+        prebuilt_flashmask_info = startend_row_indices
+        startend_row_indices = prebuilt_flashmask_info.startend_row_indices
 
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
@@ -527,26 +546,74 @@ def _flash_attn_fwd(
         overlap_view_args = overlap_ag_args.view
 
     cute_flashmask_info = None
+    fm_n_block_list, fm_n_block_chunks = None, None
     if startend_row_indices is not None:
         fm_batch_size = startend_row_indices.shape[0]
         fm_heads = startend_row_indices.shape[1]
         num_m_blocks = (seqlen_q + fwd_m_tile_rows - 1) // fwd_m_tile_rows
-        flashmask_info = FlashMaskInfoPaddle(
-            is_causal=causal,
-            startend_row_indices=startend_row_indices,
-        )
+        flashmask_info = prebuilt_flashmask_info
+        if flashmask_info is None:
+            flashmask_info = FlashMaskInfoPaddle(
+                is_causal=causal,
+                startend_row_indices=startend_row_indices,
+            )
+        else:
+            assert flashmask_info.is_causal == causal, (
+                f"prebuilt flashmask_info was built with is_causal="
+                f"{flashmask_info.is_causal}, called with causal={causal}"
+            )
         # valid_block_count (produced by reduce_block_count) feeds only the SM100
         # path and the bwd 2CTA density heuristic. The SM90 fwd kernel iterates the
         # block-sparse lists built below (build_flashmask_block_lists) and never
         # reads valid_block_count, so skip both the extra [b,h,num_m_blocks] alloc
         # and the reduce_block_count kernel launch there. Per-call fixed overhead
         # dominates the high-sparsity / short-seq configs, so this is pure win.
-        if compute_capability != 9:
+        ctx = (causal, fwd_m_tile_rows, n_block_size, seqlen_q)
+        reuse_block_count = (
+            compute_capability != 9
+            and flashmask_info.valid_block_count is not None
+        )
+        if reuse_block_count and flashmask_info.block_count_ctx != ctx:
+            # The reduction is per-tiling, so a count carried over from a different
+            # one would silently select the wrong blocks.
+            raise ValueError(
+                f"prebuilt flashmask_info carries valid_block_count for "
+                f"{flashmask_info.block_count_ctx} (causal, m_tile_rows, "
+                f"n_block_size, seqlen_q), but this call needs {ctx}"
+            )
+        if compute_capability != 9 and not reuse_block_count:
             flashmask_info.valid_block_count = paddle.empty([fm_batch_size, fm_heads, num_m_blocks], dtype=paddle.int32)
         prepare_block_maxmin(flashmask_info, kBlockN=n_block_size)
         cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
-        if compute_capability != 9:
+        if compute_capability != 9 and not reuse_block_count:
             reduce_block_count(cute_flashmask_info, causal, fwd_m_tile_rows, n_block_size, seqlen_q)
+            flashmask_info.block_count_ctx = ctx
+        # Precompute the fwd's surviving-n_block list. Without it, generate_block
+        # rescans all ceil(seqlen_k / n_block_size) blocks for every work tile -- at
+        # S=65536 / n=64 that is 1032 blocks scanned per tile to find ~8 survivors,
+        # and it is redone for each of the 64 q heads even though the mask has a
+        # single flashmask head, so the identical classification is repeated 64x
+        # inside the attention kernel's critical path.
+        #
+        # Local (explicit sliding window) is excluded: the builder reproduces the
+        # kernel's n_block bounds for the dense and causal cases only, and silently
+        # disagreeing there would select the wrong blocks.
+        if (
+            compute_capability == 10
+            and flashmask_fwd_n_block_list
+            and window_size_left is None
+            and window_size_right is None
+            and seqlen_q is not None
+        ):
+            fm_n_block_list, fm_n_block_chunks = build_fwd_n_block_list(
+                flashmask_info,
+                causal,
+                fwd_m_tile_rows,
+                n_block_size,
+                seqlen_q,
+            )
+        else:
+            fm_n_block_list, fm_n_block_chunks = None, None
 
     if page_table is not None:
         assert cu_seqlens_k is None, "page_table is not supported with cu_seqlens_k"
@@ -1007,6 +1074,19 @@ def _flash_attn_fwd(
         overlap_kv_chunk_size = None
         overlap_bhsd_layout = None
 
+    # Precomputed flashmask n_block list -> cute tensors for the kernel. Leading dim is
+    # the innermost (list slot / m tile), which is the contiguous one for both.
+    fm_n_block_list_tensor = (
+        from_dlpack(fm_n_block_list, assumed_align=4).mark_layout_dynamic(leading_dim=3)
+        if fm_n_block_list is not None
+        else None
+    )
+    fm_n_block_chunks_tensor = (
+        from_dlpack(fm_n_block_chunks, assumed_align=4).mark_layout_dynamic(leading_dim=2)
+        if fm_n_block_chunks is not None
+        else None
+    )
+
     compile_key = (
         dtype,
         head_dim,
@@ -1041,6 +1121,10 @@ def _flash_attn_fwd(
         block_logit is None,
         block_size,
         block_bos is None,
+        # Changes the SMEM layout and the scheduler, so it needs its own artifact.
+        flashmask_d512_unalias_sO_sQ,
+        # Selects generate_block's copy-the-list path over the in-kernel scan.
+        fm_n_block_list_tensor is not None,
     ) + (
         # SRBuffer K/V require a distinct artifact only when overlap is active.
         (overlap_bhsd_layout, overlap_kv_chunk_size) if enable_overlap else ()
@@ -1096,6 +1180,7 @@ def _flash_attn_fwd(
                 block_size=block_size,
                 has_block_bos=block_bos is not None,
                 use_2cta_instrs=use_2cta_instrs,
+                flashmask_d512_unalias_sO_sQ=flashmask_d512_unalias_sO_sQ,
             )
         else:
             raise ValueError(
@@ -1125,6 +1210,8 @@ def _flash_attn_fwd(
                 {
                     "mBlockLogit": block_logit_tensor,
                     "mBlockBos": block_bos_tensor,
+                    "mFmNBlockList": fm_n_block_list_tensor,
+                    "mFmNBlockChunks": fm_n_block_chunks_tensor,
                 }
                 if compute_capability == 10
                 else {}
@@ -1171,6 +1258,8 @@ def _flash_attn_fwd(
             {
                 "mBlockLogit": block_logit_tensor,
                 "mBlockBos": block_bos_tensor,
+                "mFmNBlockList": fm_n_block_list_tensor,
+                "mFmNBlockChunks": fm_n_block_chunks_tensor,
             }
             if compute_capability == 10
             else {}

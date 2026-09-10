@@ -399,6 +399,135 @@ class StaticPersistentClusterTileScheduler:
         return StaticPersistentClusterTileScheduler(*(tuple(obj_list)), loc=self._loc)
 
 
+class StaticPersistentClusterSharedTileScheduler:
+    """Persistent scheduler for the `cluster_share_tile == True` convention.
+
+    The SM100 forward's 2-CTA UMMA splits the MMA tiler's M across the pair, so ONE
+    work tile IS one CTA pair and `num_block` is already counted in work_tile_m rows
+    (see the fwd's tile_sched_args). Both CTAs of a cluster must therefore resolve the
+    SAME tile and run the same number of iterations.
+
+    Neither existing persistent scheduler does that:
+      - StaticPersistentTileScheduler keys the tile off block_idx and strides by
+        grid_dim, so the two CTAs of a pair start on different tiles and, when
+        total_blocks is not a multiple of grid_dim, iterate a different number of
+        times. One CTA then reaches the TMEM dealloc handshake while its peer is still
+        mid-tile and the cluster deadlocks. It never reads cluster_share_tile at all.
+      - StaticPersistentClusterTileScheduler is pair-based but assumes the bwd
+        convention (num_block per CTA, the pair covering two ADJACENT blocks), which
+        it asserts.
+
+    This one keys the tile off the cluster and hands both CTAs the identical
+    coordinate.
+    """
+
+    @dataclass
+    class Params(ParamsBase):
+        # Plain Int32 for the same reason as the sibling scheduler: these divisions run
+        # once per work tile, so the FastDivmod magic numbers buy nothing.
+        tiles_per_hb: Int32
+        num_head: Int32
+        total_tiles: Int32
+        cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
+
+        @staticmethod
+        @cute.jit
+        def create(
+            args: TileSchedulerArguments, *, loc=None, ip=None
+        ) -> "StaticPersistentClusterSharedTileScheduler.Params":
+            assert args.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] == 1 is supported"
+            assert args.cluster_share_tile, (
+                "StaticPersistentClusterSharedTileScheduler assumes per-PAIR num_block; "
+                "use StaticPersistentClusterTileScheduler for the per-CTA convention"
+            )
+            # No ceil_div by the cluster size: num_block already counts work tiles, i.e.
+            # pairs, which is what cluster_share_tile means.
+            return StaticPersistentClusterSharedTileScheduler.Params(
+                tiles_per_hb=Int32(args.num_block),
+                num_head=Int32(args.num_head),
+                total_tiles=Int32(args.num_block * args.num_head * args.num_batch),
+                cluster_shape_mn=args.cluster_shape_mn,
+            )
+
+    def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
+        self.params = params
+        self._tile_idx = tile_idx
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(args: TileSchedulerArguments, *, loc=None, ip=None) -> Params:
+        return StaticPersistentClusterSharedTileScheduler.Params.create(args, loc=loc, ip=ip)
+
+    @staticmethod
+    @cute.jit
+    def create(
+        params: Params, *, loc=None, ip=None
+    ) -> "StaticPersistentClusterSharedTileScheduler":
+        # Both CTAs of a cluster get the same index: integer-divide the block index by
+        # the cluster size instead of using it directly.
+        tile_idx = cute.arch.block_idx()[0] // params.cluster_shape_mn[0]
+        return StaticPersistentClusterSharedTileScheduler(params, tile_idx, loc=loc, ip=ip)
+
+    # called by host
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        cluster = params.cluster_shape_mn[0]
+        hardware_info = cutlass.utils.HardwareInfo()
+        sm_count = hardware_info.get_device_multiprocessor_count()
+        # A cluster launch needs grid.x to be a multiple of the cluster size. Every tile
+        # occupies a whole pair, so the useful ceiling is total_tiles * cluster CTAs;
+        # rounding up can overshoot and those CTAs just see no valid tile.
+        num_blk_x = cute.round_up(cutlass.min(sm_count, params.total_tiles * cluster), cluster)
+        return (num_blk_x, Int32(1), Int32(1))
+
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        params = self.params
+        hb_idx = self._tile_idx // params.tiles_per_hb
+        tile_in_hb = self._tile_idx - hb_idx * params.tiles_per_hb
+        batch_idx = hb_idx // params.num_head
+        head_idx = hb_idx - batch_idx * params.num_head
+        # No cta_rank_in_cluster term: the pair shares the tile, which is the whole
+        # point of this variant.
+        is_valid = self._tile_idx < params.total_tiles
+        return WorkTileInfo(
+            (Int32(tile_in_hb), Int32(head_idx), Int32(batch_idx), Int32(0)), is_valid
+        )
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        pass
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        # Stride in clusters, not CTAs, so both CTAs of a pair stay on the same tile.
+        self._tile_idx += cute.arch.grid_dim()[0] // self.params.cluster_shape_mn[0]
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [self.params, self._tile_idx]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip([self.params, self._tile_idx], self._values_pos):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return StaticPersistentClusterSharedTileScheduler(
+            *(tuple(obj_list)), loc=self._loc
+        )
+
+
 class SingleTileLPTScheduler:
     @dataclass
     class Params(ParamsBase):
