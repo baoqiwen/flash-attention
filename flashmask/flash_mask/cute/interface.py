@@ -48,6 +48,7 @@ from flash_mask.cute.flashmask_utils import (
     compute_flashmask_block_lists,
     build_flashmask_block_lists,
     build_fwd_n_block_list,
+    refine_fwd_n_block_list,
 )
 
 from flash_mask.cute.block_sparsity import (
@@ -347,6 +348,30 @@ def _flash_attn_fwd(
     # heads that share a KV head instead of the m_blocks of one head. None = auto
     # (on when qhead_per_kvhead > 1 and the launch lands on SingleTileScheduler).
     flashmask_fwd_head_major: Optional[bool] = None,
+    # SM100 2-CTA folded (dv > 256) only: run the S/P pipeline two deep along the KV-block
+    # axis so the MMA warp issues QK(b+1) before waiting for softmax(b)'s P, instead of
+    # strictly alternating with the softmax warpgroup. None = auto (on for that config).
+    flashmask_fwd_s_pipe_n: Optional[bool] = None,
+    # SM100 2-CTA folded only, and only when num_head == m_block_size with one KV head
+    # and a head-independent mask: put the q HEADS on the accumulator's M axis so a work
+    # tile spans 2 query TOKENS instead of 128 rows, which is what lets the surviving
+    # n_block list be narrowed to those 2 rows. None = auto (on when eligible).
+    flashmask_fwd_head_in_m: Optional[bool] = None,
+    # SM100 Split-D only: K/V pipeline depth (default 2). 3 is what FlashMLA's sparse
+    # prefill uses; it costs one more KV stage of SMEM and gives the MMA warp prefetch
+    # slack, which is what flashmask_fwd_s_pipe_n needs to pay off.
+    flashmask_fwd_kv_stage: Optional[int] = None,
+    # SM100 2-CTA folded only: hand S back to the MMA warp as soon as softmax has read it
+    # into registers (S_empty barrier) so the next QK can issue without waiting for the
+    # exp / P store / O rescale. Same overlap as flashmask_fwd_s_pipe_n but with one S
+    # buffer and no extra branches in softmax_step. Default off pending measurement.
+    flashmask_fwd_early_s_release: bool = False,
+    # SM100 only: override the persistent-scheduler decision. Exists to separate the
+    # two things flashmask_d512_unalias_sO_sQ bundles -- un-aliasing sO from sQ (which
+    # un-serialises the tile boundary: today tile i's O must drain out of sQ before
+    # tile i+1's Q can land in it) and switching to the persistent scheduler (which at
+    # 32768 work tiles has nothing to win). None = the usual derivation.
+    flashmask_fwd_persistent: Optional[bool] = None,
 ) -> Tuple[paddle.Tensor, paddle.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -923,6 +948,47 @@ def _flash_attn_fwd(
         # both need q_stage=1 so O (head_dim_v cols) fits alongside S/P in the 512-col TMEM.
         is_split_d = (head_dim > 192 and head_dim == head_dim_v) or is_bigd_fwd
 
+    # N-axis S/P pipeline. Only the 2-CTA folded (dv > 256) config: it is the one with a
+    # single Q tile, so its MMA warp cannot issue the next QK until softmax has released the
+    # single S buffer -- MMA and softmax strictly alternate. With two S/P buffers QK(b+1) is
+    # issued before softmax(b) is waited for. Costs one extra 8KB sP buffer and 0 TMEM
+    # columns (the second S buffer is already reserved at num_s_stages == 1).
+    # use_2cta_instrs is only set for the big-d (Split-D) path and m_block_size < 128 only
+    # for its dv > 256 folded variant, so those two conditions pin the config exactly.
+    fwd_s_pipe_n_eligible = (
+        compute_capability == 10
+        and use_2cta_instrs
+        and m_block_size < 128
+        and block_sparse_tensors is None
+    )
+    if flashmask_fwd_s_pipe_n is None:
+        # OFF by default: measured 7.7639 -> 9.5365 ms on the S=65536 HCA fwd
+        # (benchmark_hca_flashmask.py --doc_lens 65536 --n_hca_layers 36), i.e. +23%.
+        # Output is bit-identical to the original schedule, so this is purely a
+        # scheduling regression -- kept behind the flag for A/B. Suspects, in order:
+        # the new consumer_wait(K(b+1)) now sits in front of PV(b) with only a
+        # one-stage-deep KV pipeline (kv_stage == 2), and the extra dynamic branches
+        # softmax_step needs to pick a buffer may spill at 168 registers.
+        fwd_s_pipe_n = False
+    else:
+        fwd_s_pipe_n = flashmask_fwd_s_pipe_n and fwd_s_pipe_n_eligible
+
+    # Early S release: the cheaper route to the same MMA/softmax overlap (one S
+    # buffer plus an S_empty handshake). Same config gate as fwd_s_pipe_n, and the
+    # two are mutually exclusive.
+    fwd_early_s_release = (
+        flashmask_fwd_early_s_release and fwd_s_pipe_n_eligible and not fwd_s_pipe_n
+    )
+
+    fwd_is_persistent_default = (
+        not causal and not local and cu_seqlens_q is None and seqused_q is None
+    )
+    fwd_is_persistent = (
+        fwd_is_persistent_default
+        if flashmask_fwd_persistent is None
+        else flashmask_fwd_persistent
+    )
+
     if num_splits < 1:
         max_seqlen_k = (
             seqlen_k
@@ -957,9 +1023,93 @@ def _flash_attn_fwd(
         )
         lse_partial = paddle.empty(shape=[num_splits, *lse_shape], dtype=paddle.float32)
 
+    # Heads on the accumulator's M axis (see FlashAttentionForwardSm100.fwd_head_in_m).
+    # A CTA's m_block_size rows become the q heads of ONE query token, so a work tile
+    # spans fwd_cta_group_size TOKENS and the block list can be narrowed from the 128-row
+    # union down to those 2 rows -- 543.8 -> 478.8 walked cols/row on the S=65536 HCA
+    # mask. Requires:
+    #   - m_block_size == num_head (a CTA's rows == all q heads of one token) and a
+    #     single KV head, because those rows share ONE K/V tile
+    #   - a head-independent mask (h_flashmask == 1): the tile spans every head
+    #   - q / out row-major, since the kernel is handed [b, s*h, 1, d] VIEWS of them
+    #   - no causal / local: row-vs-column limits are meaningless when rows are heads
+    def _is_row_major(t):
+        expected, strides = 1, []
+        for size in reversed(t.shape):
+            strides.append(expected)
+            expected *= size
+        return tuple(t.strides) == tuple(reversed(strides))
+
+    fwd_head_in_m_eligible = (
+        compute_capability == 10
+        and use_2cta_instrs
+        and m_block_size < 128
+        and m_block_size == num_head
+        and num_head_kv == 1
+        and not causal
+        and not local
+        and not is_split_kv
+        and not pack_gqa
+        and cu_seqlens_q is None
+        and seqused_q is None
+        and page_table is None
+        and not enable_overlap
+        and block_sparse_tensors is None
+        and cute_flashmask_info is not None
+        and flashmask_info.startend_row_indices.shape[1] == 1
+        and fm_n_block_list is not None
+        and seqlen_q % fwd_cta_group_size == 0
+        and _is_row_major(q)
+        and _is_row_major(out)
+        and (lse is None or _is_row_major(lse))
+    )
+    if flashmask_fwd_head_in_m is None:
+        fwd_head_in_m = fwd_head_in_m_eligible
+    else:
+        fwd_head_in_m = flashmask_fwd_head_in_m and fwd_head_in_m_eligible
+
+    fwd_n_block_fine_stride = None
+    if fwd_head_in_m:
+        (
+            fine_list,
+            fine_chunks,
+            fine_count,
+            fwd_n_block_fine_stride,
+        ) = refine_fwd_n_block_list(
+            flashmask_info,
+            fm_n_block_list,
+            fwd_m_tile_rows,
+            fwd_cta_group_size,
+            n_block_size,
+            seqlen_q,
+            seqlen_k,
+        )
+        if fine_list is None:
+            fwd_head_in_m = False
+        else:
+            # The kernel reads the same fields, just narrowed: the list/chunks it copies
+            # per work tile and the per-tile block count every warp group trips on.
+            fm_n_block_list, fm_n_block_chunks = fine_list, fine_chunks
+            cute_flashmask_info = cute_flashmask_info._replace(
+                valid_block_count=from_dlpack(
+                    fine_count, assumed_align=4
+                ).mark_layout_dynamic(leading_dim=2)
+            )
+
+    if fwd_head_in_m:
+        # Rows become (token, head) pairs. q[b, s, :, :] is contiguous, so this is a
+        # VIEW: the kernel's (m_block_size, head_dim) Q/O tiles then land on the 64 heads
+        # of token m_tile_index, and grid.y collapses to one head.
+        q_for_kernel = q.reshape([batch_size, seqlen_q * num_head, 1, head_dim])
+        out_for_kernel = out.reshape([batch_size, seqlen_q * num_head, 1, head_dim_v])
+        # head_major co-schedules heads that share a KV head; they are inside the tile now.
+        fwd_head_major = False
+    else:
+        q_for_kernel, out_for_kernel = q, out
+
     q_tensor, o_tensor = [
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
-        for t in (q, out if not is_split_kv else out_partial)
+        for t in (q_for_kernel, out_for_kernel if not is_split_kv else out_partial)
     ]
     if enable_overlap:
         # K/V live in the NVSHMEM SRBuffer (gathered device memory), so there is no
@@ -1162,6 +1312,17 @@ def _flash_attn_fwd(
         fm_n_block_list_tensor is not None,
         # Changes the grid shape and the blockIdx -> (block, head) decode.
         fwd_head_major,
+        # Doubles the S/P pipeline along N: extra sP buffer + a different MMA schedule.
+        fwd_s_pipe_n,
+        # Rows become (token, head): different Q/O views, mask row semantics and list.
+        fwd_head_in_m,
+        fwd_n_block_fine_stride,
+        # Changes the SMEM footprint and every KV-pipeline mbarrier count.
+        flashmask_fwd_kv_stage,
+        # Adds the S_empty barrier and reorders the MMA warp's inner loop.
+        fwd_early_s_release,
+        # Selects the scheduler, so it needs its own artifact.
+        fwd_is_persistent,
     ) + (
         # SRBuffer K/V require a distinct artifact only when overlap is active.
         (overlap_bhsd_layout, overlap_kv_chunk_size) if enable_overlap else ()
@@ -1202,11 +1363,7 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
-                is_persistent=not causal
-                and not local
-                and cu_seqlens_q is None
-                and seqused_q is None
-                and not is_split_kv,
+                is_persistent=fwd_is_persistent and not is_split_kv,
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
@@ -1219,6 +1376,11 @@ def _flash_attn_fwd(
                 use_2cta_instrs=use_2cta_instrs,
                 flashmask_d512_unalias_sO_sQ=flashmask_d512_unalias_sO_sQ,
                 fwd_head_major=fwd_head_major,
+                fwd_s_pipe_n=fwd_s_pipe_n,
+                fwd_head_in_m=fwd_head_in_m,
+                fwd_n_block_fine_stride=fwd_n_block_fine_stride,
+                fwd_kv_stage=flashmask_fwd_kv_stage,
+                fwd_early_s_release=fwd_early_s_release,
             )
         else:
             raise ValueError(
